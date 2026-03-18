@@ -1,0 +1,271 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>createAgentSession 初始化流程图</title>
+    <script src="https://cdn.jsdelivr.net/npm/mermaid@10/dist/mermaid.min.js"></script>
+    <style>
+        body {
+            display: flex;
+            justify-content: center;
+            align-items: center;
+            min-height: 100vh;
+            margin: 0;
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+        }
+        .container {
+            background: white;
+            padding: 40px;
+            border-radius: 16px;
+            box-shadow: 0 20px 60px rgba(0,0,0,0.5);
+            max-width: 1600px;
+            overflow-x: auto;
+        }
+        h1 {
+            text-align: center;
+            color: #1a1a2e;
+            margin-bottom: 10px;
+            font-size: 28px;
+        }
+        .subtitle {
+            text-align: center;
+            color: #666;
+            margin-bottom: 30px;
+            font-size: 14px;
+        }
+        .mermaid {
+            display: flex;
+            justify-content: center;
+        }
+        .legend {
+            margin-top: 30px;
+            padding: 20px;
+            background: #f8f9fa;
+            border-radius: 8px;
+        }
+        .legend h3 {
+            margin-top: 0;
+            color: #333;
+        }
+        .legend-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(250px, 1fr));
+            gap: 15px;
+        }
+        .legend-item {
+            display: flex;
+            align-items: center;
+            gap: 10px;
+        }
+        .legend-color {
+            width: 24px;
+            height: 24px;
+            border-radius: 4px;
+            border: 2px solid #666;
+        }
+        .detail-section {
+            margin-top: 30px;
+        }
+        .detail-section h3 {
+            color: #333;
+            border-bottom: 2px solid #667eea;
+            padding-bottom: 10px;
+            margin-top: 20px;
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <h1>🤖 createAgentSession 初始化流程</h1>
+        <p class="subtitle">Agent 会话创建与资源加载完整链路</p>
+        <div class="mermaid">
+flowchart TD
+    A["🚀 调用 createAgentSession<br/>(入口函数)"] --> B["📝 参数初始化<br/>与默认值填充"]
+    B --> C["🔧 创建/加载<br/>基础依赖"]
+    C --> D["📦 资源加载器<br/>初始化"]
+    D --> E["💾 会话上下文<br/>恢复"]
+    E --> F["🧠 模型与思考等级<br/>解析"]
+    F --> G["⚙️ Agent 核心<br/>实例创建"]
+    G --> H["🔗 AgentSession<br/>实例组装"]
+    H --> I["✅ 返回初始化<br/>结果"]
+
+    subgraph ParamInit["📝 参数初始化"]
+        B1["cwd: 默认为<br/>process.cwd()"]
+        B2["agentDir: 默认为<br/>~/.pi/agent"]
+    end
+
+    subgraph DepCreate["🔧 基础依赖创建"]
+        C1["AuthStorage<br/>认证信息存储"]
+        C2["ModelRegistry<br/>模型注册与管理"]
+        C3["SettingsManager<br/>全局/项目设置管理"]
+        C4["SessionManager<br/>会话持久化管理"]
+    end
+
+    subgraph ResLoad["📦 资源加载"]
+        D1["加载 Extensions<br/>扩展"]
+        D2["加载 Skills<br/>技能包"]
+        D3["加载 Prompt Templates<br/>提示词模板"]
+        D4["加载 Themes<br/>主题"]
+        D5["加载 AGENTS.md 等<br/>上下文文件"]
+    end
+
+    subgraph SessionRestore["💾 会话恢复"]
+        E1["检查是否有<br/>已存在的会话数据"]
+        E2["恢复历史消息<br/>上下文"]
+        E3["恢复之前的<br/>模型配置"]
+    end
+
+    subgraph ModelParse["🧠 模型解析"]
+        F1["优先使用用户传入的<br/>model 参数"]
+        F2["其次尝试从会话历史中<br/>恢复模型"]
+        F3["最后通过 findInitialModel<br/>自动选择可用模型"]
+        F4["思考等级匹配模型能力<br/>不支持推理则设为 off"]
+    end
+
+    subgraph AgentInst["⚙️ Agent 实例化"]
+        G1["配置 convertToLlm<br/>消息转换层"]
+        G2["配置 getApiKey<br/>动态密钥获取"]
+        G3["配置 transformContext<br/>上下文转换钩子"]
+        G4["配置工具执行、<br/>重试等策略"]
+    end
+
+    B --> B1
+    B --> B2
+    C --> C1
+    C --> C2
+    C --> C3
+    C --> C4
+    D --> D1
+    D --> D2
+    D --> D3
+    D --> D4
+    D --> D5
+    E --> E1
+    E --> E2
+    E --> E3
+    F --> F1
+    F --> F2
+    F --> F3
+    F --> F4
+    G --> G1
+    G --> G2
+    G --> G3
+    G --> G4
+
+    classDef mainFlow fill:#667eea,color:#fff,stroke:#5a67d8,stroke-width:3px,rx:8
+    classDef subFlow fill:#e3f2fd,stroke:#1976d2,stroke-width:2px,rx:6
+    classDef default fill:#f5f5f5,stroke:#616161,stroke-width:2px
+
+    class A,B,C,D,E,F,G,H,I mainFlow
+    class B1,B2,C1,C2,C3,C4,D1,D2,D3,D4,D5,E1,E2,E3,F1,F2,F3,F4,G1,G2,G3,G4 subFlow
+        </div>
+
+        <div class="legend">
+            <h3>📊 流程阶段说明</h3>
+            <div class="legend-grid">
+                <div class="legend-item">
+                    <div class="legend-color" style="background: #667eea;"></div>
+                    <div><strong>主流程</strong> - 核心步骤</div>
+                </div>
+                <div class="legend-item">
+                    <div class="legend-color" style="background: #e3f2fd;"></div>
+                    <div><strong>子步骤</strong> - 详细操作</div>
+                </div>
+            </div>
+        </div>
+
+        <div class="detail-section">
+            <h3>📋 各阶段详细说明</h3>
+
+            <table style="width: 100%; border-collapse: collapse; margin-top: 15px;">
+                <thead>
+                    <tr style="background: #667eea; color: white;">
+                        <th style="padding: 12px; text-align: left;">阶段</th>
+                        <th style="padding: 12px; text-align: left;">职责</th>
+                        <th style="padding: 12px; text-align: left;">关键输出</th>
+                    </tr>
+                </thead>
+                <tbody>
+                    <tr style="background: #f8f9fa;">
+                        <td style="padding: 12px; border: 1px solid #dee2e6;"><strong>参数初始化</strong></td>
+                        <td style="padding: 12px; border: 1px solid #dee2e6;">填充默认值，标准化输入参数</td>
+                        <td style="padding: 12px; border: 1px solid #dee2e6;">标准化配置对象</td>
+                    </tr>
+                    <tr>
+                        <td style="padding: 12px; border: 1px solid #dee2e6;"><strong>基础依赖创建</strong></td>
+                        <td style="padding: 12px; border: 1px solid #dee2e6;">创建认证、模型、设置、会话管理器</td>
+                        <td style="padding: 12px; border: 1px solid #dee2e6;">4 个核心管理器实例</td>
+                    </tr>
+                    <tr style="background: #f8f9fa;">
+                        <td style="padding: 12px; border: 1px solid #dee2e6;"><strong>资源加载</strong></td>
+                        <td style="padding: 12px; border: 1px solid #dee2e6;">加载扩展、技能、模板、主题、上下文文件</td>
+                        <td style="padding: 12px; border: 1px solid #dee2e6;">可用资源清单</td>
+                    </tr>
+                    <tr>
+                        <td style="padding: 12px; border: 1px solid #dee2e6;"><strong>会话恢复</strong></td>
+                        <td style="padding: 12px; border: 1px solid #dee2e6;">检查并恢复已有会话状态</td>
+                        <td style="padding: 12px; border: 1px solid #dee2e6;">历史上下文</td>
+                    </tr>
+                    <tr style="background: #f8f9fa;">
+                        <td style="padding: 12px; border: 1px solid #dee2e6;"><strong>模型解析</strong></td>
+                        <td style="padding: 12px; border: 1px solid #dee2e6;">三级优先级选择模型，匹配思考等级</td>
+                        <td style="padding: 12px; border: 1px solid #dee2e6;">最终模型配置</td>
+                    </tr>
+                    <tr>
+                        <td style="padding: 12px; border: 1px solid #dee2e6;"><strong>Agent 实例化</strong></td>
+                        <td style="padding: 12px; border: 1px solid #dee2e6;">配置消息转换、密钥获取、上下文钩子、执行策略</td>
+                        <td style="padding: 12px; border: 1px solid #dee2e6;">Agent 核心实例</td>
+                    </tr>
+                    <tr style="background: #f8f9fa;">
+                        <td style="padding: 12px; border: 1px solid #dee2e6;"><strong>Session 组装</strong></td>
+                        <td style="padding: 12px; border: 1px solid #dee2e6;">组合所有组件为完整会话</td>
+                        <td style="padding: 12px; border: 1px solid #dee2e6;">AgentSession 实例</td>
+                    </tr>
+                </tbody>
+            </table>
+        </div>
+
+        <div class="detail-section">
+            <h3>🎯 模型选择优先级</h3>
+            <div style="background: linear-gradient(90deg, #667eea 0%, #764ba2 100%); padding: 20px; border-radius: 8px; color: white;">
+                <div style="display: flex; align-items: center; justify-content: space-between; margin-bottom: 10px;">
+                    <span style="font-size: 18px; font-weight: bold;">1️⃣ 用户传入 model 参数</span>
+                    <span style="background: rgba(255,255,255,0.2); padding: 5px 15px; border-radius: 20px;">最高优先级</span>
+                </div>
+                <div style="font-size: 24px; text-align: center;">↓</div>
+                <div style="display: flex; align-items: center; justify-content: space-between; margin: 10px 0;">
+                    <span style="font-size: 18px; font-weight: bold;">2️⃣ 会话历史恢复模型</span>
+                    <span style="background: rgba(255,255,255,0.2); padding: 5px 15px; border-radius: 20px;">中等优先级</span>
+                </div>
+                <div style="font-size: 24px; text-align: center;">↓</div>
+                <div style="display: flex; align-items: center; justify-content: space-between; margin: 10px 0;">
+                    <span style="font-size: 18px; font-weight: bold;">3️⃣ findInitialModel 自动选择</span>
+                    <span style="background: rgba(255,255,255,0.2); padding: 5px 15px; border-radius: 20px;">回退策略</span>
+                </div>
+            </div>
+        </div>
+    </div>
+    <script>
+        mermaid.initialize({
+            startOnLoad: true,
+            theme: 'base',
+            themeVariables: {
+                primaryColor: '#e3f2fd',
+                primaryTextColor: '#1a1a2e',
+                primaryBorderColor: '#1565c0',
+                lineColor: '#546e7a',
+                secondaryColor: '#fff3e0',
+                tertiaryColor: '#c8e6c9'
+            },
+            flowchart: {
+                useMaxWidth: true,
+                htmlLabels: true,
+                curve: 'basis',
+                padding: 20
+            }
+        });
+    </script>
+</body>
+</html>
