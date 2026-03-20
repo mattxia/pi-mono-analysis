@@ -1,6 +1,7 @@
 # pi-ai 实现架构全解析
 
 ## 一、整体架构设计
+
 pi-ai 是一个高度抽象的 LLM 统一接入层，采用四层架构设计，屏蔽不同 LLM 提供商的差异，提供统一的 API 接口：
 
 ```mermaid
@@ -29,6 +30,7 @@ flowchart TD
 ```
 
 ## 二、核心类与接口关系
+
 ```mermaid
 classDiagram
     class Model {
@@ -115,17 +117,19 @@ classDiagram
 ```
 
 ### 核心接口说明
-| 接口/类 | 定义位置 | 核心功能 |
-|---------|----------|----------|
-| `Model` | [src/types.ts#L300](file:///d:/prj/pi-mono-analysis/packages/ai/src/types.ts#L300) | 统一的模型元数据定义，包含能力、价格、上下文窗口等信息 |
-| `Message` | [src/types.ts#L186](file:///d:/prj/pi-mono-analysis/packages/ai/src/types.ts#L186) | 统一的消息类型，涵盖用户、助理、工具结果三种角色 |
-| `Context` | [src/types.ts#L225](file:///d:/prj/pi-mono-analysis/packages/ai/src/types.ts#L225) | LLM 请求上下文，包含系统提示、消息历史、工具定义 |
-| `AssistantMessageEventStream` | [src/utils/event-stream.ts](file:///d:/prj/pi-mono-analysis/packages/ai/src/utils/event-stream.ts) | 异步迭代器流式响应，标准化所有 LLM 的输出格式 |
-| `StreamFunction` | [src/types.ts#L118](file:///d:/prj/pi-mono-analysis/packages/ai/src/types.ts#L118) | Provider 实现接口，所有 LLM 提供商都需要实现这个接口 |
+
+| 接口/类                          | 定义位置                                                                                               | 核心功能                              |
+| ----------------------------- | -------------------------------------------------------------------------------------------------- | --------------------------------- |
+| `Model`                       | [src/types.ts#L300](file:///d:/prj/pi-mono-analysis/packages/ai/src/types.ts#L300)                 | 统一的模型元数据定义，包含能力、价格、上下文窗口等信息       |
+| `Message`                     | [src/types.ts#L186](file:///d:/prj/pi-mono-analysis/packages/ai/src/types.ts#L186)                 | 统一的消息类型，涵盖用户、助理、工具结果三种角色          |
+| `Context`                     | [src/types.ts#L225](file:///d:/prj/pi-mono-analysis/packages/ai/src/types.ts#L225)                 | LLM 请求上下文，包含系统提示、消息历史、工具定义        |
+| `AssistantMessageEventStream` | [src/utils/event-stream.ts](file:///d:/prj/pi-mono-analysis/packages/ai/src/utils/event-stream.ts) | 异步迭代器流式响应，标准化所有 LLM 的输出格式         |
+| `StreamFunction`              | [src/types.ts#L118](file:///d:/prj/pi-mono-analysis/packages/ai/src/types.ts#L118)                 | Provider 实现接口，所有 LLM 提供商都需要实现这个接口 |
 
 ## 三、核心模块实现
 
-### 1. 事件流系统 [src/utils/event-stream.ts]
+### 1. 事件流系统 \[src/utils/event-stream.ts]
+
 ```typescript
 export class AssistantMessageEventStream
   implements AsyncIterableIterator<AssistantMessageEvent>
@@ -167,13 +171,16 @@ export class AssistantMessageEventStream
   }
 }
 ```
+
 **设计亮点**：
+
 - 统一所有 LLM 提供商的流式输出格式
 - 支持异步迭代，可直接使用 `for await...of` 遍历
 - 内置 Promise，可通过 `result()` 等待完整响应
 - 事件驱动，支持实时处理增量输出
 
-### 2. 模型管理系统 [src/models.ts]
+### 2. 模型管理系统 \[src/models.ts]
+
 ```typescript
 const modelRegistry: Map<string, Map<string, Model<Api>>> = new Map();
 
@@ -205,13 +212,16 @@ export function calculateCost<TApi extends Api>(model: Model<TApi>, usage: Usage
   return usage.cost;
 }
 ```
+
 **特性**：
+
 - 内置 798+ 支持工具调用的模型元数据
 - 支持自动计算请求费用（美元）
 - 支持模型能力检测（多模态、思考能力等）
 - 自动生成脚本同步最新模型列表：[scripts/generate-models.ts](file:///d:/prj/pi-mono-analysis/packages/ai/scripts/generate-models.ts)
 
-### 3. 流处理核心 [src/stream.ts]
+### 3. 流处理核心 \[src/stream.ts]
+
 ```typescript
 // 底层流接口，使用Provider原生参数
 export function stream<TApi extends Api>(
@@ -243,13 +253,16 @@ export async function complete<TApi extends Api>(
   return s.result();
 }
 ```
+
 **设计特点**：
+
 - 提供两层API：底层 `stream` 支持 Provider 特定参数，上层 `streamSimple` 统一参数格式
 - 自动路由到对应的 Provider 实现
 - 统一错误处理，所有异常都通过事件流返回
 - 支持请求中断（`AbortSignal`）
 
-### 4. Provider 动态注册机制 [src/api-registry.ts]
+### 4. Provider 动态注册机制 \[src/api-registry.ts]
+
 ```typescript
 const apiRegistry = new Map<Api, ApiProvider>();
 
@@ -275,14 +288,17 @@ export function getApiProvider(api: Api): ApiProvider | undefined {
   return apiRegistry.get(api);
 }
 ```
+
 **扩展能力**：
+
 - 支持动态注册新的 LLM 提供商
 - 无需修改核心代码即可扩展支持新的 API
-- 支持 Provider 特定的参数映射逻辑
+- 支持 Provider 特定的参数映射逻辑 
 
 ## 四、主要场景实现流程
 
 ### 1. 基础 LLM 请求流程
+
 ```mermaid
 sequenceDiagram
     participant App as 上层应用
@@ -306,7 +322,9 @@ sequenceDiagram
     Provider->>EventStream: 发送done事件，设置完整消息
     EventStream-->>App: 返回完整AssistantMessage
 ```
+
 **关键代码示例**：
+
 ```typescript
 // 基础使用示例
 import { getModel, stream } from "@mariozechner/pi-ai";
@@ -345,6 +363,7 @@ console.log(`\n总Token消耗: ${finalMessage.usage.totalTokens}`);
 ```
 
 ### 2. 工具调用流程
+
 ```mermaid
 sequenceDiagram
     participant App as 上层应用
@@ -363,7 +382,9 @@ sequenceDiagram
     Stream->>Provider: 继续请求LLM
     Provider-->>EventStream: 返回最终回答
 ```
+
 **工具定义示例**：
+
 ```typescript
 import { Type } from "@mariozechner/pi-ai";
 
@@ -380,6 +401,7 @@ const tools = [
 ```
 
 ### 3. 多模态请求流程
+
 ```mermaid
 sequenceDiagram
     participant App as 上层应用
@@ -392,7 +414,9 @@ sequenceDiagram
     LLM API-->>Provider: 返回响应
     Provider-->>EventStream: 转换为统一事件
 ```
+
 **多模态请求示例**：
+
 ```typescript
 const context = {
   messages: [
@@ -413,7 +437,9 @@ const context = {
 ```
 
 ## 五、Provider 适配层实现（以OpenAI Responses API为例）
+
 **代码位置**：[src/providers/openai-responses.ts](file:///d:/prj/pi-mono-analysis/packages/ai/src/providers/openai-responses.ts)
+
 ```typescript
 export const streamOpenAIResponses: StreamFunction = (model, context, options) => {
   const stream = new AssistantMessageEventStream();
@@ -475,20 +501,22 @@ export const streamOpenAIResponses: StreamFunction = (model, context, options) =
 ```
 
 ## 六、内置支持的 LLM 提供商
-| 提供商 | API类型 | 代码路径 |
-|--------|---------|----------|
-| Anthropic | anthropic-messages | [src/providers/anthropic.ts](file:///d:/prj/pi-mono-analysis/packages/ai/src/providers/anthropic.ts) |
-| OpenAI Responses | openai-responses | [src/providers/openai-responses.ts](file:///d:/prj/pi-mono-analysis/packages/ai/src/providers/openai-responses.ts) |
-| Azure OpenAI | azure-openai-responses | [src/providers/azure-openai-responses.ts](file:///d:/prj/pi-mono-analysis/packages/ai/src/providers/azure-openai-responses.ts) |
-| OpenAI Completions | openai-completions | [src/providers/openai-completions.ts](file:///d:/prj/pi-mono-analysis/packages/ai/src/providers/openai-completions.ts) |
-| Google Gemini | google-generative-ai | [src/providers/google.ts](file:///d:/prj/pi-mono-analysis/packages/ai/src/providers/google.ts) |
-| Google Vertex AI | google-vertex | [src/providers/google-vertex.ts](file:///d:/prj/pi-mono-analysis/packages/ai/src/providers/google-vertex.ts) |
-| Amazon Bedrock | bedrock-converse-stream | [src/providers/amazon-bedrock.ts](file:///d:/prj/pi-mono-analysis/packages/ai/src/providers/amazon-bedrock.ts) |
-| Mistral | mistral-conversations | [src/providers/mistral.ts](file:///d:/prj/pi-mono-analysis/packages/ai/src/providers/mistral.ts) |
-| OpenRouter | openai-responses | 兼容OpenAI协议 |
-| Vercel AI Gateway | openai-responses | 兼容OpenAI协议 |
+
+| 提供商                | API类型                   | 代码路径                                                                                                                           |
+| ------------------ | ----------------------- | ------------------------------------------------------------------------------------------------------------------------------ |
+| Anthropic          | anthropic-messages      | [src/providers/anthropic.ts](file:///d:/prj/pi-mono-analysis/packages/ai/src/providers/anthropic.ts)                           |
+| OpenAI Responses   | openai-responses        | [src/providers/openai-responses.ts](file:///d:/prj/pi-mono-analysis/packages/ai/src/providers/openai-responses.ts)             |
+| Azure OpenAI       | azure-openai-responses  | [src/providers/azure-openai-responses.ts](file:///d:/prj/pi-mono-analysis/packages/ai/src/providers/azure-openai-responses.ts) |
+| OpenAI Completions | openai-completions      | [src/providers/openai-completions.ts](file:///d:/prj/pi-mono-analysis/packages/ai/src/providers/openai-completions.ts)         |
+| Google Gemini      | google-generative-ai    | [src/providers/google.ts](file:///d:/prj/pi-mono-analysis/packages/ai/src/providers/google.ts)                                 |
+| Google Vertex AI   | google-vertex           | [src/providers/google-vertex.ts](file:///d:/prj/pi-mono-analysis/packages/ai/src/providers/google-vertex.ts)                   |
+| Amazon Bedrock     | bedrock-converse-stream | [src/providers/amazon-bedrock.ts](file:///d:/prj/pi-mono-analysis/packages/ai/src/providers/amazon-bedrock.ts)                 |
+| Mistral            | mistral-conversations   | [src/providers/mistral.ts](file:///d:/prj/pi-mono-analysis/packages/ai/src/providers/mistral.ts)                               |
+| OpenRouter         | openai-responses        | 兼容OpenAI协议                                                                                                                     |
+| Vercel AI Gateway  | openai-responses        | 兼容OpenAI协议                                                                                                                     |
 
 ## 七、核心设计亮点
+
 1. **完全抽象**：所有 LLM 提供商差异被完全屏蔽，上层应用无需关心底层实现
 2. **全流式设计**：所有 API 都是流式的，支持实时响应，无阻塞等待
 3. **类型安全**：完整的 TypeScript 类型定义，所有参数和返回值都有类型校验
@@ -496,3 +524,4 @@ export const streamOpenAIResponses: StreamFunction = (model, context, options) =
 5. **高性能**：轻量级封装，几乎无额外性能开销
 6. **统一工具调用**：所有支持工具调用的模型都使用相同的工具定义格式
 7. **内置计费**：自动计算请求费用，支持成本控制
+
