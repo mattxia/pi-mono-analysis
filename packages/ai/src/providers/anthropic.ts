@@ -1,3 +1,24 @@
+/**
+ * Anthropic API Provider
+ *
+ * 实现与 Anthropic Claude API 的流式交互，支持以下功能：
+ * - 文本生成与流式输出
+ * - 图像输入（多模态）
+ * - 工具调用（Tool Use）
+ * - 扩展思考（Thinking/Reasoning）
+ * - 缓存控制（Cache Control）
+ * - GitHub Copilot 集成
+ * - OAuth 认证（Claude Code）
+ *
+ * 支持的模型：
+ * - Claude 3.x 系列（Haiku, Sonnet, Opus）
+ * - Claude 4.x 系列（支持自适应思考）
+ *
+ * 认证方式：
+ * - API Key（标准认证）
+ * - OAuth Token（Claude Code，以 sk-ant-oat 开头）
+ * - GitHub Copilot（Bearer Token）
+ */
 import Anthropic from "@anthropic-ai/sdk";
 import type {
 	ContentBlockParam,
@@ -33,8 +54,21 @@ import { adjustMaxTokensForThinking, buildBaseOptions } from "./simple-options.j
 import { transformMessages } from "./transform-messages.js";
 
 /**
- * Resolve cache retention preference.
- * Defaults to "short" and uses PI_CACHE_RETENTION for backward compatibility.
+ * 解析缓存保留偏好设置
+ *
+ * 确定消息缓存的保留策略，用于优化 API 调用成本和响应速度。
+ * 缓存可以让 Anthropic API 重用之前处理过的内容，减少重复计算的 token 费用。
+ *
+ * @param cacheRetention - 可选的缓存保留级别参数
+ * @returns 缓存保留级别
+ *
+ * 缓存保留级别说明：
+ * - "none": 不使用缓存，每次都重新处理
+ * - "short"/"ephemeral": 使用临时缓存，无 TTL 限制
+ * - "long": 使用长期缓存，设置 1 小时 TTL（仅当使用官方 api.anthropic.com 端点时）
+ *
+ * 环境变量：
+ * - PI_CACHE_RETENTION=long: 设置默认缓存行为为长期缓存
  */
 function resolveCacheRetention(cacheRetention?: CacheRetention): CacheRetention {
 	if (cacheRetention) {
@@ -46,6 +80,20 @@ function resolveCacheRetention(cacheRetention?: CacheRetention): CacheRetention 
 	return "short";
 }
 
+/**
+ * 获取缓存控制配置
+ *
+ * 根据 baseUrl 和缓存保留级别生成 Anthropic API 所需的 cache_control 对象。
+ * 只有官方 Anthropic API 端点才支持 TTL（生存时间）设置。
+ *
+ * @param baseUrl - API 基础 URL
+ * @param cacheRetention - 可选的缓存保留级别
+ * @returns 包含保留级别和可选缓存控制对象的配置
+ *
+ * 注意：
+ * - 自定义端点（如阿里云、z.ai 等）不支持 TTL，只能使用 ephemeral 缓存
+ * - TTL 设置为 "1h" 表示缓存 1 小时后过期
+ */
 function getCacheControl(
 	baseUrl: string,
 	cacheRetention?: CacheRetention,
@@ -61,12 +109,26 @@ function getCacheControl(
 	};
 }
 
-// Stealth mode: Mimic Claude Code's tool naming exactly
+// ============================================================================
+// Claude Code 兼容性配置
+// ============================================================================
+
+/**
+ * Claude Code 版本号
+ * 用于在 OAuth 认证时模拟 Claude Code 客户端的身份
+ * 来源：https://github.com/badlogic/cchistory
+ */
 const claudeCodeVersion = "2.1.75";
 
-// Claude Code 2.x tool names (canonical casing)
-// Source: https://cchistory.mariozechner.at/data/prompts-2.1.11.md
-// To update: https://github.com/badlogic/cchistory
+/**
+ * Claude Code 2.x 工具名称列表（标准命名）
+ *
+ * 这些是 Claude Code CLI 使用的标准工具名称。
+ * 当使用 OAuth Token 时，需要将工具名称映射到这些标准名称，
+ * 以便 Anthropic API 识别为 Claude Code 客户端。
+ *
+ * 来源：https://cchistory.mariozechner.at/data/prompts-2.1.11.md
+ */
 const claudeCodeTools = [
 	"Read",
 	"Write",
@@ -87,10 +149,32 @@ const claudeCodeTools = [
 	"WebSearch",
 ];
 
+/**
+ * Claude Code 工具名称查找表
+ * 键：小写名称，值：标准名称（首字母大写）
+ */
 const ccToolLookup = new Map(claudeCodeTools.map((t) => [t.toLowerCase(), t]));
 
-// Convert tool name to CC canonical casing if it matches (case-insensitive)
+/**
+ * 将工具名称转换为 Claude Code 标准命名
+ *
+ * 当使用 OAuth Token 时，将本地工具名称映射到 Claude Code 的标准工具名称。
+ * 例如："read" -> "Read", "bash" -> "Bash"
+ *
+ * @param name - 原始工具名称
+ * @returns 标准化后的工具名称（如果匹配），否则返回原名称
+ */
 const toClaudeCodeName = (name: string) => ccToolLookup.get(name.toLowerCase()) ?? name;
+
+/**
+ * 从 Claude Code 标准名称还原为本地工具名称
+ *
+ * 当从 API 接收工具调用响应时，将标准名称还原为本地定义的工具名称。
+ *
+ * @param name - Claude Code 标准名称
+ * @param tools - 本地工具列表（用于查找匹配的工具）
+ * @returns 还原后的工具名称
+ */
 const fromClaudeCodeName = (name: string, tools?: Tool[]) => {
 	if (tools && tools.length > 0) {
 		const lowerName = name.toLowerCase();
@@ -101,7 +185,22 @@ const fromClaudeCodeName = (name: string, tools?: Tool[]) => {
 };
 
 /**
- * Convert content blocks to Anthropic API format
+ * 将内容块转换为 Anthropic API 格式
+ *
+ * 处理文本和图像内容，将其转换为 Anthropic API 可识别的格式。
+ * 支持纯文本、纯图像或混合内容。
+ *
+ * @param content - 内容块数组（文本或图像）
+ * @returns 字符串（纯文本时）或内容块数组（包含图像时）
+ *
+ * 处理逻辑：
+ * 1. 如果只有文本：合并为单个字符串
+ * 2. 如果有图像：转换为 base64 编码的图像块
+ * 3. 如果只有图像没有文本：添加占位符文本 "(see attached image)"
+ *
+ * 注意：
+ * - 所有文本都会通过 sanitizeSurrogates 处理，确保 Unicode 编码正确
+ * - 图像支持 JPEG、PNG、GIF、WebP 格式
  */
 function convertContentBlocks(content: (TextContent | ImageContent)[]):
 	| string
@@ -180,6 +279,15 @@ export interface AnthropicOptions extends StreamOptions {
 	toolChoice?: "auto" | "any" | "none" | { type: "tool"; name: string };
 }
 
+/**
+ * 合并多个 HTTP 头对象
+ *
+ * 将多个头对象合并为一个，后面的头会覆盖前面的同名键。
+ * 用于合并模型默认头、动态头和选项头。
+ *
+ * @param headerSources - 头对象数组（可能为 undefined）
+ * @returns 合并后的头对象
+ */
 function mergeHeaders(...headerSources: (Record<string, string> | undefined)[]): Record<string, string> {
 	const merged: Record<string, string> = {};
 	for (const headers of headerSources) {
@@ -190,6 +298,35 @@ function mergeHeaders(...headerSources: (Record<string, string> | undefined)[]):
 	return merged;
 }
 
+/**
+ * Anthropic 流式主函数
+ *
+ * 与 Anthropic API 建立流式连接，处理响应事件并生成 AssistantMessage。
+ * 这是 Anthropic provider 的核心函数，负责：
+ *
+ * 1. 客户端创建：根据认证方式（API Key/OAuth/Copilot）创建不同的客户端
+ * 2. 参数构建：构建 API 请求参数，包括消息、工具、缓存控制等
+ * 3. 流式处理：监听并处理各种流式事件
+ *    - message_start: 消息开始，初始化 token 使用统计
+ *    - content_block_start: 内容块开始（文本/思考/工具调用）
+ *    - content_block_delta: 内容增量（文本片段/思考片段/JSON 参数）
+ *    - content_block_stop: 内容块结束
+ *    - message_delta: 消息元数据更新（停止原因、最终 token 数）
+ * 4. 错误处理：捕获异常并生成错误消息
+ *
+ * @param model - 模型配置
+ * @param context - 对话上下文（系统提示、消息历史、工具定义）
+ * @param options - 可选配置（API 密钥、思考模式、缓存策略等）
+ * @returns AssistantMessageEventStream - 助理消息事件流
+ *
+ * 事件流类型：
+ * - start: 流式开始
+ * - text_start/text_delta/text_end: 文本内容
+ * - thinking_start/thinking_delta/thinking_end: 思考内容
+ * - toolcall_start/toolcall_delta/toolcall_end: 工具调用
+ * - done: 完成
+ * - error: 错误
+ */
 export const streamAnthropic: StreamFunction<"anthropic-messages", AnthropicOptions> = (
 	model: Model<"anthropic-messages">,
 	context: Context,
@@ -424,7 +561,17 @@ export const streamAnthropic: StreamFunction<"anthropic-messages", AnthropicOpti
 };
 
 /**
- * Check if a model supports adaptive thinking (Opus 4.6 and Sonnet 4.6)
+ * 检查模型是否支持自适应思考（Opus 4.6 和 Sonnet 4.6）
+ *
+ * 自适应思考（Adaptive Thinking）是 Claude 4.6 系列模型的新特性，
+ * 模型会自动决定何时思考以及思考多长时间，而不需要预先设定 token 预算。
+ *
+ * @param modelId - 模型 ID
+ * @returns 是否支持自适应思考
+ *
+ * 支持的模型：
+ * - Opus 4.6（包括带日期后缀的变体）
+ * - Sonnet 4.6（包括带日期后缀的变体）
  */
 function supportsAdaptiveThinking(modelId: string): boolean {
 	// Opus 4.6 and Sonnet 4.6 model IDs (with or without date suffix)
@@ -437,8 +584,25 @@ function supportsAdaptiveThinking(modelId: string): boolean {
 }
 
 /**
- * Map ThinkingLevel to Anthropic effort levels for adaptive thinking.
- * Note: effort "max" is only valid on Opus 4.6.
+ * 将思考级别映射到 Anthropic 的努力程度（effort）
+ *
+ * 仅适用于支持自适应思考的模型（Opus 4.6 和 Sonnet 4.6）。
+ * 努力程度控制 Claude 分配多少思考资源：
+ *
+ * @param level - 思考级别（minimal/low/medium/high/xhigh）
+ * @param modelId - 模型 ID（用于判断是否可以使用 "max" 努力程度）
+ * @returns AnthropicEffort - 努力程度（low/medium/high/max）
+ *
+ * 映射规则：
+ * - minimal/low -> low: 最小思考，简单任务直接回答
+ * - medium -> medium: 适度思考，简单查询可能跳过
+ * - high -> high: 深度推理（默认）
+ * - xhigh -> max: 无限制思考（仅 Opus 4.6 支持），否则降级为 high
+ *
+ * 注意：
+ * - "max" 努力程度仅对 Opus 4.6 有效
+ * - Sonnet 4.6 不支持 "max"，会自动降级为 "high"
+ * - 旧模型不使用此映射，使用基于预算的思考
  */
 function mapThinkingLevelToEffort(level: SimpleStreamOptions["reasoning"], modelId: string): AnthropicEffort {
 	switch (level) {
@@ -457,6 +621,27 @@ function mapThinkingLevelToEffort(level: SimpleStreamOptions["reasoning"], model
 	}
 }
 
+/**
+ * 简化的 Anthropic 流式函数（兼容 SimpleStreamOptions）
+ *
+ * 这是 streamAnthropic 的包装函数，使用 SimpleStreamOptions 接口，
+ * 提供更简洁的配置选项，自动处理思考模式的配置。
+ *
+ * @param model - 模型配置
+ * @param context - 对话上下文
+ * @param options - 简化选项（包括 reasoning 思考级别）
+ * @returns AssistantMessageEventStream
+ *
+ * 思考模式处理：
+ * 1. 无思考（!options.reasoning）：直接调用 streamAnthropic，禁用思考
+ * 2. 自适应思考模型（Opus 4.6/Sonnet 4.6）：
+ *    - 使用 adaptive thinking 模式
+ *    - 根据 reasoning 级别设置 effort
+ * 3. 旧模型：
+ *    - 使用 budget-based thinking 模式
+ *    - 调整 maxTokens 为思考预留空间
+ *    - 设置 thinkingBudgetTokens
+ */
 export const streamSimpleAnthropic: StreamFunction<"anthropic-messages", SimpleStreamOptions> = (
 	model: Model<"anthropic-messages">,
 	context: Context,
@@ -498,10 +683,54 @@ export const streamSimpleAnthropic: StreamFunction<"anthropic-messages", SimpleS
 	} satisfies AnthropicOptions);
 };
 
+/**
+ * 判断 API 密钥是否为 OAuth Token
+ *
+ * OAuth Token 用于 Claude Code 官方客户端的身份验证。
+ * OAuth Token 的格式：sk-ant-oat-xxxxx
+ *
+ * @param apiKey - API 密钥
+ * @returns 是否为 OAuth Token
+ */
 function isOAuthToken(apiKey: string): boolean {
 	return apiKey.includes("sk-ant-oat");
 }
 
+/**
+ * 创建 Anthropic SDK 客户端
+ *
+ * 根据不同的认证方式和 provider 创建合适的 Anthropic 客户端实例。
+ * 支持三种认证方式：
+ *
+ * @param model - 模型配置
+ * @param apiKey - API 密钥
+ * @param interleavedThinking - 是否启用交错思考（interleaved thinking）
+ * @param optionsHeaders - 可选的自定义头
+ * @param dynamicHeaders - 可选的动态头（如 Copilot 的动态头）
+ * @returns 包含客户端和 OAuth 标记的对象
+ *
+ * 1. GitHub Copilot（Bearer 认证）：
+ *    - 使用 authToken 而非 apiKey
+ *    - 仅启用必要的 beta 功能（interleaved-thinking）
+ *    - 不启用 fine-grained-tool-streaming
+ *
+ * 2. OAuth Token（Claude Code）：
+ *    - 使用 authToken 而非 apiKey
+ *    - 添加 Claude Code 身份标识头（user-agent, x-app）
+ *    - 启用完整的 beta 功能集：
+ *      - claude-code-20250219: Claude Code 特性
+ *      - oauth-2025-04-20: OAuth 认证
+ *      - fine-grained-tool-streaming-2025-05-14: 细粒度工具流
+ *      - interleaved-thinking-2025-05-14: 交错思考（旧模型）
+ *
+ * 3. API Key（标准认证）：
+ *    - 使用 apiKey 认证
+ *    - 启用标准 beta 功能
+ *
+ * 注意：
+ * - 自适应思考模型（Opus 4.6/Sonnet 4.6）不需要 interleaved-thinking beta
+ * - dangerouslyAllowBrowser: true 允许在浏览器环境中使用（非 Node.js）
+ */
 function createClient(
 	model: Model<"anthropic-messages">,
 	apiKey: string,
@@ -587,6 +816,45 @@ function createClient(
 	return { client, isOAuthToken: false };
 }
 
+/**
+ * 构建 API 请求参数
+ *
+ * 根据模型、上下文和选项构建 Anthropic API 的请求参数。
+ * 处理系统提示、工具、思考模式、缓存控制等配置。
+ *
+ * @param model - 模型配置
+ * @param context - 对话上下文
+ * @param isOAuthToken - 是否为 OAuth Token
+ * @param options - 可选的 Anthropic 配置
+ * @returns 流式消息创建参数
+ *
+ * 参数配置：
+ * 1. 系统提示：
+ *    - OAuth Token：必须包含 Claude Code 身份标识
+ *    - 非 OAuth Token：使用自定义系统提示
+ *    - 两者都应用缓存控制
+ *
+ * 2. 温度（temperature）：
+ *    - 与思考模式互斥
+ *    - 仅在未启用思考时使用
+ *
+ * 3. 工具（tools）：
+ *    - 如果上下文定义了工具，转换为 Anthropic 格式
+ *    - OAuth Token 时使用标准命名
+ *
+ * 4. 思考模式（thinking）：
+ *    - 自适应思考模型：使用 adaptive 类型 + effort 配置
+ *    - 旧模型：使用 enabled 类型 + budget_tokens
+ *
+ * 5. 元数据（metadata）：
+ *    - 可选的用户 ID
+ *
+ * 6. 工具选择（tool_choice）：
+ *    - auto: 自动决定是否使用工具
+ *    - any: 必须使用至少一个工具
+ *    - none: 不使用工具
+ *    - { type: "tool", name: "xxx" }: 强制使用特定工具
+ */
 function buildParams(
 	model: Model<"anthropic-messages">,
 	context: Context,
@@ -672,11 +940,55 @@ function buildParams(
 	return params;
 }
 
-// Normalize tool call IDs to match Anthropic's required pattern and length
+/**
+ * 标准化工具调用 ID
+ *
+ * Anthropic API 要求工具调用 ID 必须符合特定格式：
+ * - 只能包含字母、数字、下划线和连字符
+ * - 最大长度 64 个字符
+ *
+ * @param id - 原始工具调用 ID
+ * @returns 标准化后的 ID
+ */
 function normalizeToolCallId(id: string): string {
 	return id.replace(/[^a-zA-Z0-9_-]/g, "_").slice(0, 64);
 }
 
+/**
+ * 转换消息为 Anthropic API 格式
+ *
+ * 将内部消息格式转换为 Anthropic API 可识别的 MessageParam 数组。
+ * 处理用户消息、助理消息和工具结果消息。
+ *
+ * @param messages - 内部消息数组
+ * @param model - 模型配置
+ * @param isOAuthToken - 是否为 OAuth Token
+ * @param cacheControl - 可选的缓存控制配置
+ * @returns Anthropic API 消息参数数组
+ *
+ * 消息类型处理：
+ * 1. 用户消息（user）：
+ *    - 字符串内容：直接转换
+ *    - 多模态内容：转换为文本块 + 图像块
+ *    - 过滤空文本和不支持的图像
+ *
+ * 2. 助理消息（assistant）：
+ *    - 文本块：转换为 text 类型
+ *    - 思考块：
+ *      - Redacted thinking: 转换为 redacted_thinking 类型
+ *      - 普通 thinking: 转换为 thinking 类型（带 signature）
+ *      - 无 signature: 降级为 text 类型
+ *    - 工具调用：转换为 tool_use 类型
+ *
+ * 3. 工具结果（toolResult）：
+ *    - 合并连续的工具结果消息
+ *    - 转换为单个 user 消息包含所有 tool_result 块
+ *    - 这对于某些 Anthropic 端点（如 z.ai）是必需的
+ *
+ * 缓存控制：
+ * - 应用到最后一个 user 消息的最后一个内容块
+ * - 用于缓存对话历史，减少重复处理的 token 费用
+ */
 function convertMessages(
 	messages: Message[],
 	model: Model<"anthropic-messages">,
@@ -842,6 +1154,24 @@ function convertMessages(
 	return params;
 }
 
+/**
+ * 转换工具定义为 Anthropic API 格式
+ *
+ * 将内部工具定义转换为 Anthropic API 可识别的 Tool 对象。
+ * 使用 TypeBox 生成的 JSON Schema 作为工具参数规范。
+ *
+ * @param tools - 内部工具定义数组
+ * @param isOAuthToken - 是否为 OAuth Token
+ * @returns Anthropic API 工具数组
+ *
+ * 工具转换：
+ * - name: 工具名称（OAuth Token 时使用标准命名）
+ * - description: 工具描述
+ * - input_schema: JSON Schema 格式的参数定义
+ *   - type: "object"
+ *   - properties: 参数属性列表
+ *   - required: 必需参数列表
+ */
 function convertTools(tools: Tool[], isOAuthToken: boolean): Anthropic.Messages.Tool[] {
 	if (!tools) return [];
 
@@ -860,6 +1190,24 @@ function convertTools(tools: Tool[], isOAuthToken: boolean): Anthropic.Messages.
 	});
 }
 
+/**
+ * 映射 Anthropic 停止原因为标准停止原因
+ *
+ * 将 Anthropic API 返回的停止原因映射为内部统一的 StopReason 类型。
+ *
+ * @param reason - Anthropic API 停止原因
+ * @returns 标准化的停止原因
+ *
+ * 映射关系：
+ * - end_turn -> stop: 正常完成
+ * - max_tokens -> length: 达到 token 限制
+ * - tool_use -> toolUse: 需要调用工具
+ * - refusal -> error: 内容被拒绝
+ * - pause_turn -> stop: 暂停回合（可重新提交）
+ * - stop_sequence -> stop: 遇到停止序列
+ * - sensitive -> error: 内容被安全过滤器标记
+ * - 其他 -> 抛出错误（未知停止原因）
+ */
 function mapStopReason(reason: Anthropic.Messages.StopReason | string): StopReason {
 	switch (reason) {
 		case "end_turn":
