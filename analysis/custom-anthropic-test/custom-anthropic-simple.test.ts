@@ -12,10 +12,10 @@
 
 import { Type } from "@sinclair/typebox";
 import { describe, expect, it } from "vitest";
-import { complete, stream } from "../src/stream.js";
-import type { Context, Model, Tool } from "../src/types.js";
-import { StringEnum } from "../src/utils/typebox-helpers.js";
-import { CUSTOM_API_KEY, CUSTOM_BASE_URL, MODEL_ID } from "./custom-anthropic-config.js";
+import { complete, stream } from "../src/stream.ts";
+import type { Context, Model, Tool } from "../src/types.ts";
+import { StringEnum } from "../src/utils/typebox-helpers.ts";
+import { CUSTOM_API_KEY, CUSTOM_BASE_URL, MODEL_ID } from "./custom-anthropic-config.ts";
 
 // ============================================================================
 // 工具定义
