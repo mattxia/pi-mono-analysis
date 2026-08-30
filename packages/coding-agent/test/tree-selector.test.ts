@@ -1,15 +1,23 @@
-import { beforeAll, describe, expect, test } from "vitest";
+import { stripVTControlCharacters } from "node:util";
+import { setKeybindings, visibleWidth } from "@earendil-works/pi-tui";
+import { beforeAll, beforeEach, describe, expect, test } from "vitest";
+import { KeybindingsManager } from "../src/core/keybindings.ts";
 import type {
 	ModelChangeEntry,
 	SessionEntry,
 	SessionMessageEntry,
 	SessionTreeNode,
-} from "../src/core/session-manager.js";
-import { TreeSelectorComponent } from "../src/modes/interactive/components/tree-selector.js";
-import { initTheme } from "../src/modes/interactive/theme/theme.js";
+} from "../src/core/session-manager.ts";
+import { TreeSelectorComponent } from "../src/modes/interactive/components/tree-selector.ts";
+import { initTheme } from "../src/modes/interactive/theme/theme.ts";
 
 beforeAll(() => {
 	initTheme("dark");
+});
+
+beforeEach(() => {
+	// Ensure test isolation: keybindings are a global singleton
+	setKeybindings(new KeybindingsManager());
 });
 
 // Helper to create a user message entry
@@ -238,6 +246,82 @@ describe("TreeSelectorComponent", () => {
 			// (since that's what we navigated to via parent traversal)
 			selector.handleInput("\x04"); // Ctrl+D
 			expect(list.getSelectedNode()?.entry.id).toBe("user-2");
+		});
+	});
+
+	describe("help", () => {
+		test("renders semantic help rows without truncating narrow terminal controls", () => {
+			const entries = [userMessage("user-1", null, "hello"), assistantMessage("asst-1", "user-1", "hi")];
+			const tree = buildTree(entries);
+			const selector = new TreeSelectorComponent(
+				tree,
+				"asst-1",
+				24,
+				() => {},
+				() => {},
+			);
+
+			const plainLines = selector.render(30).map(stripVTControlCharacters);
+			const plain = plainLines.join("\n");
+			expect(plain).toContain("branch");
+			expect(plain).toContain("copy");
+			expect(plain).toContain("filters");
+			expect(plain).toContain("cycle");
+			expect(plain).toContain("label time");
+			expect(plain).not.toContain("...");
+			expect(plainLines.every((line) => visibleWidth(line) <= 30)).toBe(true);
+		});
+	});
+
+	describe("copy", () => {
+		test("copies the full selected message with ctrl+x", () => {
+			const message = `${"long message ".repeat(30)}\nsecond line`;
+			const tree = buildTree([userMessage("user-1", null, "hello"), assistantMessage("asst-1", "user-1", message)]);
+			const selector = new TreeSelectorComponent(
+				tree,
+				"asst-1",
+				24,
+				() => {},
+				() => {},
+			);
+			let copied: string | undefined;
+			selector.onCopy = (text) => {
+				copied = text;
+			};
+
+			selector.handleInput("\x18");
+
+			expect(copied).toBe(message);
+		});
+	});
+
+	describe("label timestamps", () => {
+		test("toggles label timestamps for labeled nodes", () => {
+			const entries = [userMessage("user-1", null, "hello"), assistantMessage("asst-1", "user-1", "hi")];
+			const tree = buildTree(entries);
+			const labelDate = new Date(2026, 2, 28, 14, 32, 0);
+			tree[0]!.label = "checkpoint";
+			tree[0]!.labelTimestamp = labelDate.toISOString();
+
+			const selector = new TreeSelectorComponent(
+				tree,
+				"asst-1",
+				24,
+				() => {},
+				() => {},
+			);
+
+			const list = selector.getTreeList();
+			let render = list.render(200).join("\n");
+			expect(render).toContain("[checkpoint]");
+			expect(render).not.toContain("3/28 14:32");
+			expect(render).not.toContain("[+label time]");
+
+			selector.handleInput("T");
+
+			render = list.render(200).join("\n");
+			expect(render).toContain("3/28 14:32");
+			expect(render).toContain("[+label time]");
 		});
 	});
 

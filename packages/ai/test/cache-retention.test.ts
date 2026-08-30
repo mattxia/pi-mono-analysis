@@ -1,39 +1,41 @@
-import chalk from "node_modules/chalk/source/index.js";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
-import { getModel } from "../src/models.js";
-import { stream } from "../src/stream.js";
-import type { Context, Model } from "../src/types.js";
-import { CUSTOM_API_KEY, CUSTOM_BASE_URL, MODEL_ID } from "./custom-anthropic-config.js";
+import { stream as streamAnthropic } from "../src/api/anthropic-messages.ts";
+import { stream as streamOpenAICompletions } from "../src/api/openai-completions.ts";
+import { stream as streamOpenAIResponses } from "../src/api/openai-responses.ts";
+import { getModel, stream } from "../src/compat.ts";
+import { MODELS } from "../src/models.generated.ts";
+import type { Context, Model } from "../src/types.ts";
 
-/**
- * 缓存保留功能测试（PI_CACHE_RETENTION）
- *
- * 测试 Anthropic 和 OpenAI Responses Provider 的缓存保留功能
- *
- * 缓存保留级别：
- * - none: 不使用缓存
- * - default/ephemeral: 使用临时缓存（无 TTL）
- * - long: 使用长期缓存（Anthropic: 1h, OpenAI: 24h）
- *
- * 环境变量：
- * - PI_CACHE_RETENTION: 控制默认缓存行为（"long" 或不设置）
- */
+class PayloadCaptured extends Error {
+	constructor() {
+		super("payload captured");
+		this.name = "PayloadCaptured";
+	}
+}
+
+interface OpenAICompletionsCachePayload {
+	prompt_cache_key?: string;
+	prompt_cache_retention?: string;
+}
+
+interface OpenAIResponsesCachePayload extends OpenAICompletionsCachePayload {
+	prompt_cache_options?: { mode: "explicit" };
+}
+
+function stopAfterPayload<TPayload>(capture: (payload: TPayload) => void): (payload: unknown) => never {
+	return (payload: unknown): never => {
+		capture(payload as TPayload);
+		throw new PayloadCaptured();
+	};
+}
+
 describe("Cache Retention (PI_CACHE_RETENTION)", () => {
-	// 保存原始的环境变量值，以便在测试后恢复
 	const originalEnv = process.env.PI_CACHE_RETENTION;
 
-	/**
-	 * 每个测试前清理环境变量
-	 * 确保测试之间不会相互影响
-	 */
 	beforeEach(() => {
 		delete process.env.PI_CACHE_RETENTION;
 	});
 
-	/**
-	 * 每个测试后恢复原始环境变量
-	 * 保持测试环境的隔离性
-	 */
 	afterEach(() => {
 		if (originalEnv !== undefined) {
 			process.env.PI_CACHE_RETENTION = originalEnv;
@@ -42,55 +44,22 @@ describe("Cache Retention (PI_CACHE_RETENTION)", () => {
 		}
 	});
 
-	// 基础测试上下文
 	const context: Context = {
 		systemPrompt: "You are a helpful assistant.",
 		messages: [{ role: "user", content: "Hello", timestamp: Date.now() }],
 	};
 
-	/**
-	 * 创建自定义 Anthropic 模型配置
-	 * 用于在没有标准 API 密钥时使用自定义 API 端点进行测试
-	 */
-	function createCustomAnthropicModel(): Model<"anthropic-messages"> {
-		return {
-			id: MODEL_ID,
-			name: MODEL_ID,
-			provider: "anthropic",
-			api: "anthropic-messages",
-			contextWindow: 200000,
-			maxTokens: 4096,
-			reasoning: false,
-			input: ["text"],
-			baseUrl: CUSTOM_BASE_URL,
-			cost: {
-				input: 0,
-				output: 0,
-				cacheRead: 0,
-				cacheWrite: 0,
-			},
-		};
-	}
-
 	describe("Anthropic Provider", () => {
-		/**
-		 * 测试 1：未设置 PI_CACHE_RETENTION 时的默认行为
-		 *
-		 * 预期结果：
-		 * - 使用临时缓存（ephemeral）
-		 * - 不设置 TTL（time-to-live）
-		 * - cache_control: { type: "ephemeral" }
-		 */
 		it.skipIf(!process.env.ANTHROPIC_API_KEY)(
 			"should use default cache TTL (no ttl field) when PI_CACHE_RETENTION is not set",
 			async () => {
-				const model = getModel("anthropic", "claude-3-5-haiku-20241022");
+				const model = getModel("anthropic", "claude-haiku-4-5");
 				let capturedPayload: any = null;
 
 				const s = stream(model, context, {
-					onPayload: (payload) => {
+					onPayload: stopAfterPayload((payload) => {
 						capturedPayload = payload;
-					},
+					}),
 				});
 
 				// Consume the stream to trigger the request
@@ -105,23 +74,15 @@ describe("Cache Retention (PI_CACHE_RETENTION)", () => {
 			},
 		);
 
-		/**
-		 * 测试 2：设置 PI_CACHE_RETENTION=long 时的行为
-		 *
-		 * 预期结果：
-		 * - 使用长期缓存
-		 * - TTL 设置为 1 小时
-		 * - cache_control: { type: "ephemeral", ttl: "1h" }
-		 */
 		it.skipIf(!process.env.ANTHROPIC_API_KEY)("should use 1h cache TTL when PI_CACHE_RETENTION=long", async () => {
 			process.env.PI_CACHE_RETENTION = "long";
-			const model = getModel("anthropic", "claude-3-5-haiku-20241022");
+			const model = getModel("anthropic", "claude-haiku-4-5");
 			let capturedPayload: any = null;
 
 			const s = stream(model, context, {
-				onPayload: (payload) => {
+				onPayload: stopAfterPayload((payload) => {
 					capturedPayload = payload;
-				},
+				}),
 			});
 
 			// Consume the stream to trigger the request
@@ -135,19 +96,11 @@ describe("Cache Retention (PI_CACHE_RETENTION)", () => {
 			expect(capturedPayload.system[0].cache_control).toEqual({ type: "ephemeral", ttl: "1h" });
 		});
 
-		/**
-		 * 测试 3：使用非官方 API 端点时的行为
-		 *
-		 * 场景：使用代理或其他兼容 API 端点
-		 * 预期结果：
-		 * - 不添加 TTL（仅使用 ephemeral）
-		 * - 因为缓存功能仅在官方 API 上有效
-		 */
-		it("should not add ttl when baseUrl is not api.anthropic.com", async () => {
+		it("should add ttl for non-api.anthropic.com baseUrl by default", async () => {
 			process.env.PI_CACHE_RETENTION = "long";
 
 			// Create a model with a different baseUrl (simulating a proxy)
-			const baseModel = getModel("anthropic", "claude-3-5-haiku-20241022");
+			const baseModel = getModel("anthropic", "claude-haiku-4-5");
 			const proxyModel = {
 				...baseModel,
 				baseUrl: "https://my-proxy.example.com/v1",
@@ -161,14 +114,13 @@ describe("Cache Retention (PI_CACHE_RETENTION)", () => {
 
 			// Since we can't easily test this without mocking, we'll skip the actual API call
 			// and just verify the helper logic works correctly
-			const { streamAnthropic } = await import("../src/providers/anthropic.js");
 
 			try {
 				const s = streamAnthropic(proxyModel, context, {
 					apiKey: "fake-key",
-					onPayload: (payload) => {
+					onPayload: stopAfterPayload((payload) => {
 						capturedPayload = payload;
-					},
+					}),
 				});
 
 				// This will fail since we're using a fake key and fake proxy, but the payload should be captured
@@ -179,33 +131,50 @@ describe("Cache Retention (PI_CACHE_RETENTION)", () => {
 				// Expected to fail
 			}
 
-			// The payload should have been captured before the error
-			if (capturedPayload) {
-				// System prompt should have cache_control WITHOUT ttl (proxy URL)
-				expect(capturedPayload.system[0].cache_control).toEqual({ type: "ephemeral" });
-			}
+			expect(capturedPayload).not.toBeNull();
+			expect(capturedPayload.system[0].cache_control).toEqual({ type: "ephemeral", ttl: "1h" });
 		});
 
-		/**
-		 * 测试 4：显式设置 cacheRetention=none 时的行为
-		 *
-		 * 预期结果：
-		 * - 完全不使用缓存
-		 * - 不添加 cache_control 字段
-		 */
-		it("should omit cache_control when cacheRetention is none", async () => {
-			const baseModel = getModel("anthropic", "claude-3-5-haiku-20241022");
+		it("should omit ttl when supportsLongCacheRetention is false", async () => {
+			const baseModel = getModel("anthropic", "claude-haiku-4-5");
+			const proxyModel = {
+				...baseModel,
+				baseUrl: "https://my-proxy.example.com/v1",
+				compat: { supportsLongCacheRetention: false },
+			};
 			let capturedPayload: any = null;
 
-			const { streamAnthropic } = await import("../src/providers/anthropic.js");
+			try {
+				const s = streamAnthropic(proxyModel, context, {
+					apiKey: "fake-key",
+					cacheRetention: "long",
+					onPayload: stopAfterPayload((payload) => {
+						capturedPayload = payload;
+					}),
+				});
+
+				for await (const event of s) {
+					if (event.type === "error") break;
+				}
+			} catch {
+				// Expected to fail
+			}
+
+			expect(capturedPayload).not.toBeNull();
+			expect(capturedPayload.system[0].cache_control).toEqual({ type: "ephemeral" });
+		});
+
+		it("should omit cache_control when cacheRetention is none", async () => {
+			const baseModel = getModel("anthropic", "claude-haiku-4-5");
+			let capturedPayload: any = null;
 
 			try {
 				const s = streamAnthropic(baseModel, context, {
 					apiKey: "fake-key",
 					cacheRetention: "none",
-					onPayload: (payload) => {
+					onPayload: stopAfterPayload((payload) => {
 						capturedPayload = payload;
-					},
+					}),
 				});
 
 				for await (const event of s) {
@@ -219,25 +188,16 @@ describe("Cache Retention (PI_CACHE_RETENTION)", () => {
 			expect(capturedPayload.system[0].cache_control).toBeUndefined();
 		});
 
-		/**
-		 * 测试 5：用户消息的缓存控制
-		 *
-		 * 验证最后一个用户消息块是否正确添加了 cache_control
-		 * 预期结果：
-		 * - 最后一个消息块包含 cache_control: { type: "ephemeral" }
-		 */
 		it("should add cache_control to string user messages", async () => {
-			const baseModel = getModel("anthropic", "claude-3-5-haiku-20241022");
+			const baseModel = getModel("anthropic", "claude-haiku-4-5");
 			let capturedPayload: any = null;
-
-			const { streamAnthropic } = await import("../src/providers/anthropic.js");
 
 			try {
 				const s = streamAnthropic(baseModel, context, {
 					apiKey: "fake-key",
-					onPayload: (payload) => {
+					onPayload: stopAfterPayload((payload) => {
 						capturedPayload = payload;
-					},
+					}),
 				});
 
 				for await (const event of s) {
@@ -254,26 +214,17 @@ describe("Cache Retention (PI_CACHE_RETENTION)", () => {
 			expect(lastBlock.cache_control).toEqual({ type: "ephemeral" });
 		});
 
-		/**
-		 * 测试 6：显式设置 cacheRetention=long 时的行为
-		 *
-		 * 预期结果：
-		 * - 系统提示包含 1 小时 TTL 的缓存控制
-		 * - cache_control: { type: "ephemeral", ttl: "1h" }
-		 */
 		it("should set 1h cache TTL when cacheRetention is long", async () => {
-			const baseModel = getModel("anthropic", "claude-3-5-haiku-20241022");
+			const baseModel = getModel("anthropic", "claude-haiku-4-5");
 			let capturedPayload: any = null;
-
-			const { streamAnthropic } = await import("../src/providers/anthropic.js");
 
 			try {
 				const s = streamAnthropic(baseModel, context, {
 					apiKey: "fake-key",
 					cacheRetention: "long",
-					onPayload: (payload) => {
+					onPayload: stopAfterPayload((payload) => {
 						capturedPayload = payload;
-					},
+					}),
 				});
 
 				for await (const event of s) {
@@ -296,9 +247,9 @@ describe("Cache Retention (PI_CACHE_RETENTION)", () => {
 				let capturedPayload: any = null;
 
 				const s = stream(model, context, {
-					onPayload: (payload) => {
+					onPayload: stopAfterPayload((payload) => {
 						capturedPayload = payload;
-					},
+					}),
 				});
 
 				// Consume the stream to trigger the request
@@ -319,9 +270,9 @@ describe("Cache Retention (PI_CACHE_RETENTION)", () => {
 				let capturedPayload: any = null;
 
 				const s = stream(model, context, {
-					onPayload: (payload) => {
+					onPayload: stopAfterPayload((payload) => {
 						capturedPayload = payload;
-					},
+					}),
 				});
 
 				// Consume the stream to trigger the request
@@ -334,7 +285,7 @@ describe("Cache Retention (PI_CACHE_RETENTION)", () => {
 			},
 		);
 
-		it("should not set prompt_cache_retention when baseUrl is not api.openai.com", async () => {
+		it("should set prompt_cache_retention for non-api.openai.com baseUrl by default", async () => {
 			process.env.PI_CACHE_RETENTION = "long";
 
 			// Create a model with a different baseUrl (simulating a proxy)
@@ -346,14 +297,12 @@ describe("Cache Retention (PI_CACHE_RETENTION)", () => {
 
 			let capturedPayload: any = null;
 
-			const { streamOpenAIResponses } = await import("../src/providers/openai-responses.js");
-
 			try {
 				const s = streamOpenAIResponses(proxyModel, context, {
 					apiKey: "fake-key",
-					onPayload: (payload) => {
+					onPayload: stopAfterPayload((payload) => {
 						capturedPayload = payload;
-					},
+					}),
 				});
 
 				// This will fail since we're using a fake key and fake proxy, but the payload should be captured
@@ -364,26 +313,25 @@ describe("Cache Retention (PI_CACHE_RETENTION)", () => {
 				// Expected to fail
 			}
 
-			// The payload should have been captured before the error
-			if (capturedPayload) {
-				expect(capturedPayload.prompt_cache_retention).toBeUndefined();
-			}
+			expect(capturedPayload).not.toBeNull();
+			expect(capturedPayload.prompt_cache_retention).toBe("24h");
 		});
 
-		it("should omit prompt_cache_key when cacheRetention is none", async () => {
-			const model = getModel("openai", "gpt-4o-mini");
+		it("should omit prompt_cache_retention when supportsLongCacheRetention is false", async () => {
+			const model = {
+				...getModel("openai", "gpt-4o-mini"),
+				compat: { supportsLongCacheRetention: false },
+			};
 			let capturedPayload: any = null;
-
-			const { streamOpenAIResponses } = await import("../src/providers/openai-responses.js");
 
 			try {
 				const s = streamOpenAIResponses(model, context, {
 					apiKey: "fake-key",
-					cacheRetention: "none",
-					sessionId: "session-1",
-					onPayload: (payload) => {
+					cacheRetention: "long",
+					sessionId: "session-compat-false",
+					onPayload: stopAfterPayload((payload) => {
 						capturedPayload = payload;
-					},
+					}),
 				});
 
 				for await (const event of s) {
@@ -394,24 +342,74 @@ describe("Cache Retention (PI_CACHE_RETENTION)", () => {
 			}
 
 			expect(capturedPayload).not.toBeNull();
-			expect(capturedPayload.prompt_cache_key).toBeUndefined();
 			expect(capturedPayload.prompt_cache_retention).toBeUndefined();
+		});
+
+		it("should omit prompt_cache_key and disable implicit writes when cacheRetention is none", async () => {
+			const model = getModel("openai", "gpt-5.6-sol");
+			let capturedPayload: OpenAIResponsesCachePayload | undefined;
+
+			try {
+				const s = streamOpenAIResponses(model, context, {
+					apiKey: "fake-key",
+					cacheRetention: "none",
+					sessionId: "session-1",
+					onPayload: stopAfterPayload<OpenAIResponsesCachePayload>((payload) => {
+						capturedPayload = payload;
+					}),
+				});
+
+				for await (const event of s) {
+					if (event.type === "error") break;
+				}
+			} catch {
+				// Expected to fail
+			}
+
+			expect(capturedPayload).toBeDefined();
+			expect(capturedPayload?.prompt_cache_key).toBeUndefined();
+			expect(capturedPayload?.prompt_cache_retention).toBeUndefined();
+			expect(capturedPayload?.prompt_cache_options).toEqual({ mode: "explicit" });
+		});
+
+		it("should omit prompt_cache_options for models that reject it", async () => {
+			const model = getModel("openai", "gpt-4o-mini");
+			let capturedPayload: OpenAIResponsesCachePayload | undefined;
+
+			try {
+				const s = streamOpenAIResponses(model, context, {
+					apiKey: "fake-key",
+					cacheRetention: "none",
+					sessionId: "session-1",
+					onPayload: stopAfterPayload<OpenAIResponsesCachePayload>((payload) => {
+						capturedPayload = payload;
+					}),
+				});
+
+				for await (const event of s) {
+					if (event.type === "error") break;
+				}
+			} catch {
+				// Expected to fail
+			}
+
+			expect(capturedPayload).toBeDefined();
+			expect(capturedPayload?.prompt_cache_key).toBeUndefined();
+			expect(capturedPayload?.prompt_cache_options).toBeUndefined();
 		});
 
 		it("should set prompt_cache_retention when cacheRetention is long", async () => {
 			const model = getModel("openai", "gpt-4o-mini");
 			let capturedPayload: any = null;
 
-			const { streamOpenAIResponses } = await import("../src/providers/openai-responses.js");
-
 			try {
 				const s = streamOpenAIResponses(model, context, {
 					apiKey: "fake-key",
 					cacheRetention: "long",
 					sessionId: "session-2",
-					onPayload: (payload) => {
+					onPayload: stopAfterPayload((payload) => {
 						capturedPayload = payload;
-					},
+					}),
 				});
 
 				for await (const event of s) {
@@ -427,201 +425,105 @@ describe("Cache Retention (PI_CACHE_RETENTION)", () => {
 		});
 	});
 
-	// =============================================================================
-	// 自定义 Anthropic API 测试组
-	// 使用自定义配置的 Anthropic 兼容 API 进行缓存保留测试
-	// 这个测试组不依赖任何标准环境变量，始终运行
-	// =============================================================================
+	describe("OpenAI Completions Provider", () => {
+		function createCompletionsModel(compat?: Model<"openai-completions">["compat"]): Model<"openai-completions"> {
+			return {
+				id: "test-model",
+				name: "Test Model",
+				api: "openai-completions",
+				provider: "test-openai-completions",
+				baseUrl: "https://my-proxy.example.com/v1",
+				reasoning: false,
+				input: ["text"],
+				cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+				contextWindow: 128000,
+				maxTokens: 4096,
+				compat,
+			};
+		}
 
-	describe("Custom Anthropic API (自定义配置)", () => {
-		const customLlm = createCustomAnthropicModel();
-
-		/**
-		 * 测试 1：未设置 PI_CACHE_RETENTION 时的默认行为
-		 *
-		 * 预期结果：
-		 * - 使用临时缓存（ephemeral）
-		 * - 不设置 TTL
-		 */
-		it("should use default cache TTL (no ttl field) when PI_CACHE_RETENTION is not set", async () => {
-			const { streamAnthropic } = await import("../src/providers/anthropic.js");
+		it("should set prompt_cache_retention for non-api.openai.com baseUrl by default", async () => {
 			let capturedPayload: any = null;
 
 			try {
-				const s = streamAnthropic(customLlm, context, {
-					apiKey: CUSTOM_API_KEY,
-					onPayload: (payload) => {
-						capturedPayload = payload;
-					},
-				});
-
-				for await (const event of s) {
-					if (event.type === "error") break;
-				}
-			} catch {
-				// Expected to fail if API is not available
-			}
-
-			if (capturedPayload) {
-				expect(capturedPayload.system).toBeDefined();
-				expect(capturedPayload.system[0].cache_control).toEqual({ type: "ephemeral" });
-			}
-		});
-
-		/**
-		 * 测试 2：设置 PI_CACHE_RETENTION=long 时的行为
-		 *
-		 * 预期结果：
-		 * - 使用长期缓存
-		 * - TTL 设置为 1 小时
-		 *
-		 * 注意：自定义 API 可能不支持 TTL 功能
-		 */
-		it("should use 1h cache TTL when PI_CACHE_RETENTION=long", async () => {
-			process.env.PI_CACHE_RETENTION = "long";
-			const { streamAnthropic } = await import("../src/providers/anthropic.js");
-			let capturedPayload: any = null;
-
-			try {
-				const s = streamAnthropic(customLlm, context, {
-					apiKey: CUSTOM_API_KEY,
-					onPayload: (payload) => {
-						capturedPayload = payload;
-					},
-				});
-
-				for await (const event of s) {
-					if (event.type === "error") break;
-				}
-			} catch {
-				// Expected to fail if API is not available
-				chalk.red("Custom Anthropic API: API is not available");
-			}
-
-			// 如果 API 不支持或返回错误，跳过断言
-			if (!capturedPayload) {
-				console.log("  Custom Anthropic API: No payload captured (API may not support cache retention)");
-				return;
-			}
-
-			expect(capturedPayload.system).toBeDefined();
-			// 自定义 API 可能不支持 TTL，只检查 type 字段
-			expect(capturedPayload.system[0].cache_control.type).toBe("ephemeral");
-			// 如果有 ttl 字段，验证其值
-			if (capturedPayload.system[0].cache_control.ttl) {
-				expect(capturedPayload.system[0].cache_control.ttl).toBe("1h");
-			} else {
-				console.log("  Custom Anthropic API: cache_control.ttl not present (API does not support cache retention)");
-			}
-		});
-
-		/**
-		 * 测试 3：显式设置 cacheRetention=none 时的行为
-		 *
-		 * 预期结果：
-		 * - 完全不使用缓存
-		 * - 不添加 cache_control 字段
-		 */
-		it("should omit cache_control when cacheRetention is none", async () => {
-			const { streamAnthropic } = await import("../src/providers/anthropic.js");
-			let capturedPayload: any = null;
-
-			try {
-				const s = streamAnthropic(customLlm, context, {
-					apiKey: CUSTOM_API_KEY,
-					cacheRetention: "none",
-					onPayload: (payload) => {
-						capturedPayload = payload;
-					},
-				});
-
-				for await (const event of s) {
-					if (event.type === "error") break;
-				}
-			} catch {
-				// Expected to fail if API is not available
-			}
-
-			if (capturedPayload) {
-				expect(capturedPayload.system[0].cache_control).toBeUndefined();
-			}
-		});
-
-		/**
-		 * 测试 4：显式设置 cacheRetention=long 时的行为
-		 *
-		 * 预期结果：
-		 * - 系统提示包含 1 小时 TTL 的缓存控制
-		 *
-		 * 注意：自定义 API 可能不支持 TTL 功能
-		 */
-		it("should set 1h cache TTL when cacheRetention is long", async () => {
-			const { streamAnthropic } = await import("../src/providers/anthropic.js");
-			let capturedPayload: any = null;
-
-			try {
-				const s = streamAnthropic(customLlm, context, {
-					apiKey: CUSTOM_API_KEY,
+				const s = streamOpenAICompletions(createCompletionsModel(), context, {
+					apiKey: "fake-key",
 					cacheRetention: "long",
-					onPayload: (payload) => {
+					sessionId: "session-completions",
+					onPayload: stopAfterPayload((payload) => {
 						capturedPayload = payload;
-					},
+					}),
 				});
 
 				for await (const event of s) {
 					if (event.type === "error") break;
 				}
 			} catch {
-				// Expected to fail if API is not available
+				// Expected to fail
 			}
 
-			// 如果 API 不支持或返回错误，跳过断言
-			if (!capturedPayload) {
-				console.log("  Custom Anthropic API: No payload captured (API may not support cache retention)");
-				return;
-			}
-
-			expect(capturedPayload.system[0].cache_control).toBeDefined();
-			// 自定义 API 可能不支持 TTL，只检查 type 字段
-			expect(capturedPayload.system[0].cache_control.type).toBe("ephemeral");
-			// 如果有 ttl 字段，验证其值
-			if (capturedPayload.system[0].cache_control.ttl) {
-				expect(capturedPayload.system[0].cache_control.ttl).toBe("1h");
-			} else {
-				console.log("  Custom Anthropic API: cache_control.ttl not present (API does not support cache retention)");
-			}
+			expect(capturedPayload).not.toBeNull();
+			expect(capturedPayload.prompt_cache_key).toBe("session-completions");
+			expect(capturedPayload.prompt_cache_retention).toBe("24h");
 		});
 
-		/**
-		 * 测试 5：用户消息的缓存控制
-		 *
-		 * 验证最后一个用户消息块是否正确添加了 cache_control
-		 */
-		it("should add cache_control to string user messages", async () => {
-			const { streamAnthropic } = await import("../src/providers/anthropic.js");
+		it("should omit prompt_cache_retention when supportsLongCacheRetention is false", async () => {
 			let capturedPayload: any = null;
 
 			try {
-				const s = streamAnthropic(customLlm, context, {
-					apiKey: CUSTOM_API_KEY,
-					onPayload: (payload) => {
+				const s = streamOpenAICompletions(createCompletionsModel({ supportsLongCacheRetention: false }), context, {
+					apiKey: "fake-key",
+					cacheRetention: "long",
+					sessionId: "session-completions-false",
+					onPayload: stopAfterPayload((payload) => {
 						capturedPayload = payload;
-					},
+					}),
 				});
 
 				for await (const event of s) {
 					if (event.type === "error") break;
 				}
 			} catch {
-				// Expected to fail if API is not available
+				// Expected to fail
 			}
 
-			if (capturedPayload) {
-				const lastMessage = capturedPayload.messages[capturedPayload.messages.length - 1];
-				expect(Array.isArray(lastMessage.content)).toBe(true);
-				const lastBlock = lastMessage.content[lastMessage.content.length - 1];
-				expect(lastBlock.cache_control).toEqual({ type: "ephemeral" });
+			expect(capturedPayload).not.toBeNull();
+			expect(capturedPayload.prompt_cache_key).toBeUndefined();
+			expect(capturedPayload.prompt_cache_retention).toBeUndefined();
+		});
+
+		it.each([
+			MODELS.opencode["deepseek-v4-flash"],
+			MODELS.opencode["deepseek-v4-pro"],
+			MODELS.opencode["kimi-k2.5"],
+			MODELS.opencode["kimi-k2.6"],
+			MODELS.opencode["minimax-m2.7"],
+			MODELS["opencode-go"]["kimi-k2.6"],
+		] as const)("should omit long cache retention for $provider/$id", async (metadata) => {
+			const model = metadata as Model<"openai-completions">;
+			let capturedPayload: OpenAICompletionsCachePayload | undefined;
+
+			try {
+				const s = streamOpenAICompletions(model, context, {
+					apiKey: "fake-key",
+					cacheRetention: "long",
+					sessionId: "session-opencode-long-cache-unsupported",
+					onPayload: stopAfterPayload<OpenAICompletionsCachePayload>((payload) => {
+						capturedPayload = payload;
+					}),
+				});
+
+				for await (const event of s) {
+					if (event.type === "error") break;
+				}
+			} catch {
+				// Expected to fail
 			}
+
+			expect(model.compat?.supportsLongCacheRetention).toBe(false);
+			expect(capturedPayload).toBeDefined();
+			expect(capturedPayload?.prompt_cache_key).toBeUndefined();
+			expect(capturedPayload?.prompt_cache_retention).toBeUndefined();
 		});
 	});
 });

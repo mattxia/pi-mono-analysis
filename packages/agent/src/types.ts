@@ -1,141 +1,176 @@
-/**
- * Agent 类型定义文件
- *
- * 此文件定义了 Agent 系统的所有核心类型，包括：
- * - 流式函数类型
- * - 工具执行模式
- * - 工具钩子接口
- * - Agent 循环配置
- * - Agent 消息和状态
- * - Agent 工具类型
- * - Agent 事件类型
- */
-
 import type {
+	Api,
 	AssistantMessage,
 	AssistantMessageEvent,
+	AssistantMessageEventStream,
+	Context,
 	ImageContent,
 	Message,
 	Model,
 	SimpleStreamOptions,
-	streamSimple,
 	TextContent,
 	Tool,
 	ToolResultMessage,
-} from "@mariozechner/pi-ai";
-import type { Static, TSchema } from "@sinclair/typebox";
+	Usage,
+} from "@earendil-works/pi-ai";
+import type { Static, TSchema } from "typebox";
 
 /**
- * Agent 循环使用的流式函数类型
+ * Stream function used by the agent loop. `Models.streamSimple` satisfies
+ * this shape.
  *
- * 契约：
- * - 对于请求/模型/运行时失败，不得抛出或返回拒绝的 Promise
- * - 必须返回 AssistantMessageEventStream
- * - 失败必须通过协议事件编码到返回的流中，
- *   并在最终的 AssistantMessage 中设置 stopReason 为 "error" 或 "aborted"，
- *   同时设置 errorMessage
+ * Contract:
+ * - Must not throw or return a rejected promise for request/model/runtime failures.
+ * - Must return an AssistantMessageEventStream.
+ * - Failures must be encoded in the returned stream via protocol events and a
+ *   final AssistantMessage with stopReason "error" or "aborted" and errorMessage.
  */
 export type StreamFn = (
-	...args: Parameters<typeof streamSimple>
-) => ReturnType<typeof streamSimple> | Promise<ReturnType<typeof streamSimple>>;
+	model: Model<Api>,
+	context: Context,
+	options?: SimpleStreamOptions,
+) => AssistantMessageEventStream | Promise<AssistantMessageEventStream>;
 
 /**
- * 单个助手消息中的工具调用执行配置
+ * Configuration for how tool calls from a single assistant message are executed.
  *
- * - "sequential": 每个工具调用在准备、执行和最终化完成后，才开始下一个
- * - "parallel": 工具调用按顺序准备，然后允许的工具并发执行。
- *   最终的工具结果仍然按照助手源顺序发出
+ * - "sequential": each tool call is prepared, executed, and finalized before the next one starts.
+ * - "parallel": tool calls are prepared sequentially, then allowed tools execute concurrently.
+ *   `tool_execution_end` is emitted in tool completion order after each tool is finalized,
+ *   while tool-result message artifacts are emitted later in assistant source order.
  */
 export type ToolExecutionMode = "sequential" | "parallel";
 
-/** 助手消息发出的单个工具调用内容块 */
+/**
+ * Controls how many queued user messages are injected when the agent loop reaches a queue drain point.
+ *
+ * - "all": drain and inject every queued message at that point.
+ * - "one-at-a-time": drain and inject only the oldest queued message, leaving the rest queued for later drain points.
+ */
+export type QueueMode = "all" | "one-at-a-time";
+
+/** A single tool call content block emitted by an assistant message. */
 export type AgentToolCall = Extract<AssistantMessage["content"][number], { type: "toolCall" }>;
 
 /**
- * `beforeToolCall` 返回的结果
+ * Result returned from `beforeToolCall`.
  *
- * 返回 `{ block: true }` 可以防止工具执行。循环会发出一个错误的工具结果。
- * `reason` 成为该错误结果中显示的文本。如果省略，则使用默认的阻止消息
+ * Returning `{ block: true }` prevents the tool from executing. The loop emits an error tool result instead.
+ * `reason` becomes the text shown in that error result. If omitted, a default blocked message is used.
  */
 export interface BeforeToolCallResult {
 	block?: boolean;
 	reason?: string;
+	/**
+	 * Hint that the agent should stop after the current tool batch when this call is blocked.
+	 * Early termination only happens when every finalized tool result in the batch sets this to true.
+	 */
+	terminate?: boolean;
 }
 
 /**
- * `afterToolCall` 返回的部分覆盖
+ * Partial override returned from `afterToolCall`.
  *
- * 合并语义是按字段进行的：
- * - `content`: 如果提供，完全替换工具结果内容数组
- * - `details`: 如果提供，完全替换工具结果详情值
- * - `isError`: 如果提供，替换工具结果错误标志
+ * Merge semantics are field-by-field:
+ * - `content`: if provided, replaces the tool result content array in full
+ * - `details`: if provided, replaces the tool result details value in full
+ * - `isError`: if provided, replaces the tool result error flag
+ * - `usage`: if provided, replaces the tool result usage
+ * - `terminate`: if provided, replaces the early-termination hint
  *
- * 省略的字段保持原始执行的工具结果值。
- * `content` 或 `details` 不会进行深度合并
+ * Omitted fields keep the original executed tool result values.
+ * There is no deep merge for `content`, `details`, or `usage`.
  */
 export interface AfterToolCallResult {
 	content?: (TextContent | ImageContent)[];
 	details?: unknown;
 	isError?: boolean;
+	/** Usage from the final tool execution itself, if available. Not used for main LLM context accounting. */
+	usage?: Usage;
+	/**
+	 * Hint that the agent should stop after the current tool batch.
+	 * Early termination only happens when every finalized tool result in the batch sets this to true.
+	 */
+	terminate?: boolean;
 }
 
-/** 传递给 `beforeToolCall` 的上下文 */
+/** Context passed to `beforeToolCall`. */
 export interface BeforeToolCallContext {
-	/** 请求工具调用的助手消息 */
+	/** The assistant message that requested the tool call. */
 	assistantMessage: AssistantMessage;
-	/** 来自 `assistantMessage.content` 的原始工具调用块 */
+	/** The raw tool call block from `assistantMessage.content`. */
 	toolCall: AgentToolCall;
-	/** 目标工具模式的验证工具参数 */
+	/** Validated tool arguments for the target tool schema. */
 	args: unknown;
-	/** 工具调用准备时的当前 Agent 上下文 */
+	/** Current agent context at the time the tool call is prepared. */
 	context: AgentContext;
 }
 
-/** 传递给 `afterToolCall` 的上下文 */
+/** Context passed to `afterToolCall`. */
 export interface AfterToolCallContext {
-	/** 请求工具调用的助手消息 */
+	/** The assistant message that requested the tool call. */
 	assistantMessage: AssistantMessage;
-	/** 来自 `assistantMessage.content` 的原始工具调用块 */
+	/** The raw tool call block from `assistantMessage.content`. */
 	toolCall: AgentToolCall;
-	/** 目标工具模式的验证工具参数 */
+	/** Validated tool arguments for the target tool schema. */
 	args: unknown;
-	/** 应用任何 `afterToolCall` 覆盖之前的执行工具结果 */
+	/** The executed tool result before any `afterToolCall` overrides are applied. */
 	result: AgentToolResult<any>;
-	/** 执行的工具结果当前是否被视为错误 */
+	/** Whether the executed tool result is currently treated as an error. */
 	isError: boolean;
-	/** 工具调用最终化时的当前 Agent 上下文 */
+	/** Current agent context at the time the tool call is finalized. */
 	context: AgentContext;
 }
 
-/**
- * Agent 循环配置接口
- *
- * 扩展自 SimpleStreamOptions，添加了 Agent 特定的配置
- */
+/** Context passed to `shouldStopAfterTurn`. */
+export interface ShouldStopAfterTurnContext {
+	/** The assistant message that completed the turn. */
+	message: AssistantMessage;
+	/** Tool result messages passed to the preceding `turn_end` event. */
+	toolResults: ToolResultMessage[];
+	/** Current agent context after the turn's assistant message and tool results have been appended. */
+	context: AgentContext;
+	/** Messages that this loop invocation will return if it exits at this point. Prompt runs include the initial prompt messages; continuation runs do not include pre-existing context messages. */
+	newMessages: AgentMessage[];
+}
+
+/** Replacement runtime state used by the agent loop before starting another provider request. */
+export interface AgentLoopTurnUpdate {
+	/** Context for the next provider request. */
+	context?: AgentContext;
+	/** Model for the next provider request. */
+	model?: Model<any>;
+	/** Thinking level for the next provider request. */
+	thinkingLevel?: ThinkingLevel;
+}
+
+export interface PrepareNextTurnContext extends ShouldStopAfterTurnContext {}
+
 export interface AgentLoopConfig extends SimpleStreamOptions {
 	model: Model<any>;
 
 	/**
-	 * 在每次 LLM 调用之前，将 AgentMessage[] 转换为 LLM 兼容的 Message[]
+	 * Converts AgentMessage[] to LLM-compatible Message[] before each LLM call.
 	 *
-	 * 每个 AgentMessage 必须转换为 LLM 可以理解的 UserMessage、AssistantMessage 或 ToolResultMessage。
-	 * 无法转换的 AgentMessage（例如仅限 UI 的通知、状态消息）应该被过滤掉。
+	 * Each AgentMessage must be converted to a UserMessage, AssistantMessage, or ToolResultMessage
+	 * that the LLM can understand. AgentMessages that cannot be converted (e.g., UI-only notifications,
+	 * status messages) should be filtered out.
 	 *
-	 * 契约：不得抛出或拒绝。改为返回安全的回退值。
-	 * 抛出会中断底层 Agent 循环，而不会产生正常的事件序列
+	 * Contract: must not throw or reject. Return a safe fallback value instead.
+	 * Throwing interrupts the low-level agent loop without producing a normal event sequence.
 	 *
 	 * @example
 	 * ```typescript
 	 * convertToLlm: (messages) => messages.flatMap(m => {
 	 *   if (m.role === "custom") {
-	 *     // 将自定义消息转换为用户消息
+	 *     // Convert custom message to user message
 	 *     return [{ role: "user", content: m.content, timestamp: m.timestamp }];
 	 *   }
 	 *   if (m.role === "notification") {
-	 *     // 过滤掉仅限 UI 的消息
+	 *     // Filter out UI-only messages
 	 *     return [];
 	 *   }
-	 *   // 传递标准 LLM 消息
+	 *   // Pass through standard LLM messages
 	 *   return [m];
 	 * })
 	 * ```
@@ -143,13 +178,14 @@ export interface AgentLoopConfig extends SimpleStreamOptions {
 	convertToLlm: (messages: AgentMessage[]) => Message[] | Promise<Message[]>;
 
 	/**
-	 * 在 `convertToLlm` 之前应用于上下文的可选转换
+	 * Optional transform applied to the context before `convertToLlm`.
 	 *
-	 * 用于在 AgentMessage 级别工作的操作：
-	 * - 上下文窗口管理（修剪旧消息）
-	 * - 从外部源注入上下文
+	 * Use this for operations that work at the AgentMessage level:
+	 * - Context window management (pruning old messages)
+	 * - Injecting context from external sources
 	 *
-	 * 契约：不得抛出或拒绝。改为返回原始消息或另一个安全的回退值
+	 * Contract: must not throw or reject. Return the original messages or another
+	 * safe fallback value instead.
 	 *
 	 * @example
 	 * ```typescript
@@ -164,79 +200,109 @@ export interface AgentLoopConfig extends SimpleStreamOptions {
 	transformContext?: (messages: AgentMessage[], signal?: AbortSignal) => Promise<AgentMessage[]>;
 
 	/**
-	 * 为每次 LLM 调用动态解析 API 密钥
+	 * Resolves an API key dynamically for each LLM call.
 	 *
-	 * 适用于可能在长时间运行的工具执行阶段过期的短期 OAuth 令牌（例如 GitHub Copilot）
+	 * Useful for short-lived OAuth tokens (e.g., GitHub Copilot) that may expire
+	 * during long-running tool execution phases.
 	 *
-	 * 契约：不得抛出或拒绝。当没有可用密钥时返回 undefined
+	 * Contract: must not throw or reject. Return undefined when no key is available.
 	 */
 	getApiKey?: (provider: string) => Promise<string | undefined> | string | undefined;
 
 	/**
-	 * 返回要在运行中途注入对话的引导消息
+	 * Called after each turn fully completes and `turn_end` has been emitted.
 	 *
-	 * 在每次工具执行后调用，以检查用户中断。
-	 * 如果返回消息，剩余的工具调用会被跳过，
-	 * 这些消息会在下一次 LLM 调用之前添加到上下文中
+	 * If it returns true, the loop emits `agent_end` and exits before polling steering or follow-up queues,
+	 * without starting another LLM call. The current assistant response and any tool executions finish normally.
+	 * This callback sees the completed-turn context and runs before `prepareNextTurn`.
 	 *
-	 * 用于在 Agent 工作时"引导"它
+	 * Use this to request a graceful stop after the current turn, e.g. before context gets too full.
 	 *
-	 * 契约：不得抛出或拒绝。当没有引导消息时返回 []
+	 * Contract: must not throw or reject. Throwing interrupts the low-level agent loop without producing a normal event sequence.
+	 */
+	shouldStopAfterTurn?: (context: ShouldStopAfterTurnContext) => boolean | Promise<boolean>;
+
+	/**
+	 * Called after `turn_end` when the loop will continue, immediately before the next turn starts.
+	 * Return replacement context/model/thinking state to affect that turn.
+	 * Return undefined to keep using the current context/config.
+	 */
+	prepareNextTurn?: (
+		context: PrepareNextTurnContext,
+	) => AgentLoopTurnUpdate | undefined | Promise<AgentLoopTurnUpdate | undefined>;
+
+	/**
+	 * Returns steering messages to inject into the conversation mid-run.
+	 *
+	 * Called after the current assistant turn finishes executing its tool calls, unless `shouldStopAfterTurn` exits first.
+	 * If messages are returned, they are added to the context before the next LLM call.
+	 * Tool calls from the current assistant message are not skipped.
+	 *
+	 * Use this for "steering" the agent while it's working.
+	 *
+	 * Contract: must not throw or reject. Return [] when no steering messages are available.
 	 */
 	getSteeringMessages?: () => Promise<AgentMessage[]>;
 
 	/**
-	 * 返回在 Agent 本应停止后处理的跟进消息
+	 * Returns follow-up messages to process after the agent would otherwise stop.
 	 *
-	 * 在 Agent 没有更多工具调用且没有引导消息时调用。
-	 * 如果返回消息，它们会被添加到上下文中，Agent 会继续另一轮
+	 * Called when the agent has no more tool calls and no steering messages.
+	 * If messages are returned, they're added to the context and the agent
+	 * continues with another turn.
 	 *
-	 * 用于应该等待 Agent 完成的跟进消息
+	 * Use this for follow-up messages that should wait until the agent finishes.
 	 *
-	 * 契约：不得抛出或拒绝。当没有跟进消息时返回 []
+	 * Contract: must not throw or reject. Return [] when no follow-up messages are available.
 	 */
 	getFollowUpMessages?: () => Promise<AgentMessage[]>;
 
 	/**
-	 * 工具执行模式
-	 * - "sequential": 逐个执行工具调用
-	 * - "parallel": 按顺序预检查工具调用，然后并发执行允许的工具
+	 * Tool execution mode.
+	 * - "sequential": execute tool calls one by one
+	 * - "parallel": preflight tool calls sequentially, then execute allowed tools concurrently;
+	 *   emit `tool_execution_end` in tool completion order after each tool is finalized,
+	 *   then emit tool-result message artifacts later in assistant source order
 	 *
-	 * 默认值："parallel"
+	 * Default: "parallel"
 	 */
 	toolExecution?: ToolExecutionMode;
 
 	/**
-	 * 在工具执行之前、参数验证之后调用
+	 * Called before a tool is executed, after arguments have been validated.
 	 *
-	 * 返回 `{ block: true }` 以阻止执行。循环会发出一个错误的工具结果
-	 * 钩子接收 Agent 中止信号并负责遵守它
+	 * Return `{ block: true }` to prevent execution. The loop emits an error tool result instead.
+	 * A blocked result can also set `terminate: true` to participate in the batch early-termination rule.
+	 * The hook receives the agent abort signal and is responsible for honoring it.
 	 */
 	beforeToolCall?: (context: BeforeToolCallContext, signal?: AbortSignal) => Promise<BeforeToolCallResult | undefined>;
 
 	/**
-	 * 在工具完成执行之后、最终工具事件发出之前调用
+	 * Called after a tool finishes executing, before `tool_execution_end` and tool-result message events are emitted.
 	 *
-	 * 返回 `AfterToolCallResult` 以覆盖执行的工具结果的部分：
-	 * - `content` 替换完整的内容数组
-	 * - `details` 替换完整的详情有效载荷
-	 * - `isError` 替换错误标志
+	 * Return an `AfterToolCallResult` to override parts of the executed tool result:
+	 * - `content` replaces the full content array
+	 * - `details` replaces the full details payload
+	 * - `isError` replaces the error flag
+	 * - `usage` replaces the tool result usage
+	 * - `terminate` replaces the early-termination hint
 	 *
-	 * 任何省略的字段保持其原始值。不执行深度合并
-	 * 钩子接收 Agent 中止信号并负责遵守它
+	 * Any omitted fields keep their original values. No deep merge is performed.
+	 * The hook receives the agent abort signal and is responsible for honoring it.
 	 */
 	afterToolCall?: (context: AfterToolCallContext, signal?: AbortSignal) => Promise<AfterToolCallResult | undefined>;
 }
 
 /**
- * 支持它的模型的思考/推理级别
- * 注意："xhigh" 仅受 OpenAI gpt-5.1-codex-max、gpt-5.2、gpt-5.2-codex、gpt-5.3 和 gpt-5.3-codex 模型支持
+ * Thinking/reasoning level for models that support it.
+ * Note: "xhigh" and "max" are only supported by selected model families. Use model
+ * thinking-level metadata from @earendil-works/pi-ai to detect support for a concrete model.
  */
-export type ThinkingLevel = "off" | "minimal" | "low" | "medium" | "high" | "xhigh";
+export type ThinkingLevel = "off" | "minimal" | "low" | "medium" | "high" | "xhigh" | "max";
 
 /**
- * 自定义应用消息的可扩展接口
- * 应用可以通过声明合并扩展：
+ * Extensible interface for custom app messages.
+ * Apps can extend via declaration merging:
  *
  * @example
  * ```typescript
@@ -249,81 +315,130 @@ export type ThinkingLevel = "off" | "minimal" | "low" | "medium" | "high" | "xhi
  * ```
  */
 export interface CustomAgentMessages {
-	// 默认为空 - 应用通过声明合并扩展
+	// Empty by default - apps extend via declaration merging
 }
 
 /**
- * AgentMessage：LLM 消息 + 自定义消息的联合类型
- * 此抽象允许应用添加自定义消息类型，同时保持类型安全和与基础 LLM 消息的兼容性
+ * AgentMessage: Union of LLM messages + custom messages.
+ * This abstraction allows apps to add custom message types while maintaining
+ * type safety and compatibility with the base LLM messages.
  */
 export type AgentMessage = Message | CustomAgentMessages[keyof CustomAgentMessages];
 
 /**
- * 包含所有配置和对话数据的 Agent 状态
+ * Public agent state.
+ *
+ * `tools` and `messages` use accessor properties so implementations can copy
+ * assigned arrays before storing them.
  */
 export interface AgentState {
+	/** System prompt sent with each model request. */
 	systemPrompt: string;
+	/** Active model used for future turns. */
 	model: Model<any>;
+	/** Requested reasoning level for future turns. */
 	thinkingLevel: ThinkingLevel;
-	tools: AgentTool<any>[];
-	messages: AgentMessage[]; // 可以包含附件 + 自定义消息类型
-	isStreaming: boolean;
-	streamMessage: AgentMessage | null;
-	pendingToolCalls: Set<string>;
-	error?: string;
+	/** Available tools. Assigning a new array copies the top-level array. */
+	set tools(tools: AgentTool<any>[]);
+	get tools(): AgentTool<any>[];
+	/** Conversation transcript. Assigning a new array copies the top-level array. */
+	set messages(messages: AgentMessage[]);
+	get messages(): AgentMessage[];
+	/**
+	 * True while the agent is processing a prompt or continuation.
+	 *
+	 * This remains true until awaited `agent_end` listeners settle.
+	 */
+	readonly isStreaming: boolean;
+	/** Partial assistant message for the current streamed response, if any. */
+	readonly streamingMessage?: AgentMessage;
+	/** Tool call ids currently executing. */
+	readonly pendingToolCalls: ReadonlySet<string>;
+	/** Error message from the most recent failed or aborted assistant turn, if any. */
+	readonly errorMessage?: string;
+}
+
+/** Final or partial result produced by a tool. */
+export interface AgentToolResult<T> {
+	/** Text or image content returned to the model. */
+	content: (TextContent | ImageContent)[];
+	/** Arbitrary structured details for logs or UI rendering. */
+	details: T;
+	/** Usage from the final tool execution itself, if available. Not used for main LLM context accounting. */
+	usage?: Usage;
+	/** Names of tools introduced by this result and available from this transcript point onward. */
+	addedToolNames?: string[];
+	/**
+	 * Hint that the agent should stop after the current tool batch.
+	 * Early termination only happens when every finalized tool result in the batch sets this to true.
+	 */
+	terminate?: boolean;
 }
 
 /**
- * Agent 工具结果接口
+ * Callback used by tools to stream partial execution updates.
  *
- * 支持文本和图像的内容块，以及用于 UI 显示或日志记录的详情
+ * The callback is scoped to the current `execute()` invocation. Calls made after
+ * the tool promise settles are ignored.
  */
-export interface AgentToolResult<T> {
-	// 支持文本和图像的内容块
-	content: (TextContent | ImageContent)[];
-	// 要在 UI 中显示或记录的详情
-	details: T;
-}
-
-// 流式工具执行更新的回调
 export type AgentToolUpdateCallback<T = any> = (partialResult: AgentToolResult<T>) => void;
 
-// AgentTool 扩展 Tool 但添加了 execute 函数
+/** Tool definition used by the agent runtime. */
 export interface AgentTool<TParameters extends TSchema = TSchema, TDetails = any> extends Tool<TParameters> {
-	// 要在 UI 中显示的工具的人类可读标签
+	/** Human-readable label for UI display. */
 	label: string;
+	/**
+	 * Optional compatibility shim for raw tool-call arguments before schema validation.
+	 * Must return an object that matches `TParameters`.
+	 */
+	prepareArguments?: (args: unknown) => Static<TParameters>;
+	/** Execute the tool call. Throw on failure instead of encoding errors in `content`. */
 	execute: (
 		toolCallId: string,
 		params: Static<TParameters>,
 		signal?: AbortSignal,
 		onUpdate?: AgentToolUpdateCallback<TDetails>,
 	) => Promise<AgentToolResult<TDetails>>;
+	/**
+	 * Per-tool execution mode override.
+	 * - "sequential": this tool must execute one at a time with other tool calls.
+	 * - "parallel": this tool can execute concurrently with other tool calls.
+	 *
+	 * If omitted, the default execution mode applies.
+	 */
+	executionMode?: ToolExecutionMode;
 }
 
-// AgentContext 类似于 Context 但使用 AgentTool
+/** Context snapshot passed into the low-level agent loop. */
 export interface AgentContext {
+	/** System prompt included with the request. */
 	systemPrompt: string;
+	/** Transcript visible to the model. */
 	messages: AgentMessage[];
+	/** Tools available for this run. */
 	tools?: AgentTool<any>[];
 }
 
 /**
- * Agent 为 UI 更新发出的事件
- * 这些事件提供消息、轮次和工具执行的细粒度生命周期信息
+ * Events emitted by the Agent for UI updates.
+ *
+ * `agent_end` is the last event emitted for a run, but awaited `Agent.subscribe()`
+ * listeners for that event are still part of run settlement. The agent becomes
+ * idle only after those listeners finish.
  */
 export type AgentEvent =
-	// Agent 生命周期
+	// Agent lifecycle
 	| { type: "agent_start" }
 	| { type: "agent_end"; messages: AgentMessage[] }
-	// 轮次生命周期 - 一个轮次是一个助手响应 + 任何工具调用/结果
+	// Turn lifecycle - a turn is one assistant response + any tool calls/results
 	| { type: "turn_start" }
 	| { type: "turn_end"; message: AgentMessage; toolResults: ToolResultMessage[] }
-	// 消息生命周期 - 为用户、助手和 toolResult 消息发出
+	// Message lifecycle - emitted for user, assistant, and toolResult messages
 	| { type: "message_start"; message: AgentMessage }
-	// 仅在流式传输期间为助手消息发出
+	// Only emitted for assistant messages during streaming
 	| { type: "message_update"; message: AgentMessage; assistantMessageEvent: AssistantMessageEvent }
 	| { type: "message_end"; message: AgentMessage }
-	// 工具执行生命周期
+	// Tool execution lifecycle
 	| { type: "tool_execution_start"; toolCallId: string; toolName: string; args: any }
 	| { type: "tool_execution_update"; toolCallId: string; toolName: string; args: any; partialResult: any }
 	| { type: "tool_execution_end"; toolCallId: string; toolName: string; result: any; isError: boolean };

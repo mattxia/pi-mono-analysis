@@ -1,5 +1,6 @@
 node_modules/
 dist/
+.artifacts/
 *.log
 .DS_Store
 *.tsbuildinfo
@@ -7,6 +8,9 @@ dist/
 packages/*/dist/
 packages/*/dist-chrome/
 packages/*/dist-firefox/
+packages/ai/src/providers/data/
+packages/ai/src/providers/.model-generation-*/
+*.cpuprofile
 
 # Environment
 .env
@@ -15,6 +19,7 @@ packages/*/dist-firefox/
 .vscode/
 .zed/
 .idea/
+.claude/
 *.swp
 *.swo
 *~
@@ -33,3 +38,7 @@ pi-*.html
 out.html
 packages/coding-agent/binaries/
 todo.md
+plans/
+.pi/hf-sessions/
+.pi/hf-sessions-backup/
+collect.sh

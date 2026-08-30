@@ -1,6 +1,6 @@
-import type { AgentMessage } from "@mariozechner/pi-agent-core";
-import type { AssistantMessage, Usage } from "@mariozechner/pi-ai";
-import { getModel } from "@mariozechner/pi-ai";
+import type { AgentMessage } from "@earendil-works/pi-agent-core";
+import type { AssistantMessage, Usage } from "@earendil-works/pi-ai/compat";
+import { getModel } from "@earendil-works/pi-ai/compat";
 import { readFileSync } from "fs";
 import { join } from "path";
 import { beforeEach, describe, expect, it } from "vitest";
@@ -9,21 +9,23 @@ import {
 	calculateContextTokens,
 	compact,
 	DEFAULT_COMPACTION_SETTINGS,
+	estimateContextTokens,
 	findCutPoint,
 	getLastAssistantUsage,
 	prepareCompaction,
 	shouldCompact,
-} from "../src/core/compaction/index.js";
+} from "../src/core/compaction/index.ts";
 import {
 	buildSessionContext,
 	type CompactionEntry,
+	type CustomMessageEntry,
 	type ModelChangeEntry,
 	migrateSessionEntries,
 	parseSessionEntries,
 	type SessionEntry,
 	type SessionMessageEntry,
 	type ThinkingLevelChangeEntry,
-} from "../src/core/session-manager.js";
+} from "../src/core/session-manager.ts";
 
 // ============================================================================
 // Test fixtures
@@ -133,6 +135,57 @@ function createThinkingLevelEntry(thinkingLevel: string): ThinkingLevelChangeEnt
 	return entry;
 }
 
+function createCustomMessageEntry(content: string): CustomMessageEntry {
+	const id = `test-id-${entryCounter++}`;
+	const entry: CustomMessageEntry = {
+		type: "custom_message",
+		id,
+		parentId: lastId,
+		timestamp: new Date().toISOString(),
+		customType: "test",
+		content,
+		display: true,
+	};
+	lastId = id;
+	return entry;
+}
+
+function extractText(messages: AgentMessage[]): string {
+	return messages
+		.map((message) => {
+			switch (message.role) {
+				case "user":
+					return typeof message.content === "string"
+						? message.content
+						: message.content
+								.filter((block): block is { type: "text"; text: string } => block.type === "text")
+								.map((block) => block.text)
+								.join(" ");
+				case "assistant":
+					return message.content
+						.filter((block): block is { type: "text"; text: string } => block.type === "text")
+						.map((block) => block.text)
+						.join(" ");
+				case "branchSummary":
+				case "compactionSummary":
+					return message.summary;
+				case "custom":
+				case "toolResult":
+					return typeof message.content === "string"
+						? message.content
+						: message.content
+								.filter((block): block is { type: "text"; text: string } => block.type === "text")
+								.map((block) => block.text)
+								.join(" ");
+				case "bashExecution":
+					return `${message.command}\n${message.output}`;
+				default:
+					return "";
+			}
+		})
+		.join("\n");
+}
+
 // ============================================================================
 // Unit tests
 // ============================================================================
@@ -181,9 +234,40 @@ describe("getLastAssistantUsage", () => {
 		expect(usage!.input).toBe(100);
 	});
 
+	it("should skip all-zero assistant usage", () => {
+		const entries: SessionEntry[] = [
+			createMessageEntry(createUserMessage("Hello")),
+			createMessageEntry(createAssistantMessage("Hi", createMockUsage(100, 50))),
+			createMessageEntry(createUserMessage("continue")),
+			createMessageEntry(createAssistantMessage("Partial", createMockUsage(0, 0))),
+		];
+
+		const usage = getLastAssistantUsage(entries);
+		expect(usage).not.toBeNull();
+		expect(usage!.input).toBe(100);
+	});
+
 	it("should return undefined if no assistant messages", () => {
 		const entries: SessionEntry[] = [createMessageEntry(createUserMessage("Hello"))];
 		expect(getLastAssistantUsage(entries)).toBeUndefined();
+	});
+});
+
+describe("estimateContextTokens", () => {
+	it("uses the last non-zero assistant usage as the context anchor", () => {
+		const messages: AgentMessage[] = [
+			createUserMessage("Hello"),
+			createAssistantMessage("Hi", createMockUsage(100, 50)),
+			createUserMessage("continue"),
+			createAssistantMessage("Partial thinking", createMockUsage(0, 0)),
+		];
+
+		const estimate = estimateContextTokens(messages);
+
+		expect(estimate.usageTokens).toBe(150);
+		expect(estimate.lastUsageIndex).toBe(1);
+		expect(estimate.trailingTokens).toBeGreaterThan(0);
+		expect(estimate.tokens).toBe(150 + estimate.trailingTokens);
 	});
 });
 
@@ -270,6 +354,25 @@ describe("findCutPoint", () => {
 			expect(result.turnStartIndex).toBe(2); // Turn 2 starts at index 2
 		}
 	});
+
+	it("should budget context-visible custom message entries", () => {
+		const entries: SessionEntry[] = [
+			createMessageEntry(createUserMessage("hi")),
+			createMessageEntry(createAssistantMessage("hello")),
+			createCustomMessageEntry("x".repeat(4000)),
+			createMessageEntry(createAssistantMessage("ok")),
+		];
+
+		const tinyBudget = findCutPoint(entries, 0, entries.length, 1);
+		expect(tinyBudget.firstKeptEntryIndex).toBe(3);
+		expect(tinyBudget.isSplitTurn).toBe(true);
+		expect(tinyBudget.turnStartIndex).toBe(2);
+
+		const customFitsBudget = findCutPoint(entries, 0, entries.length, 2);
+		expect(customFitsBudget.firstKeptEntryIndex).toBe(2);
+		expect(customFitsBudget.isSplitTurn).toBe(false);
+		expect(customFitsBudget.turnStartIndex).toBe(-1);
+	});
 });
 
 describe("buildSessionContext", () => {
@@ -355,6 +458,50 @@ describe("buildSessionContext", () => {
 		// model_change is later overwritten by assistant message's model info
 		expect(loaded.model).toEqual({ provider: "anthropic", modelId: "claude-sonnet-4-5" });
 		expect(loaded.thinkingLevel).toBe("high");
+	});
+});
+
+describe("prepareCompaction with previous compaction", () => {
+	it("should skip repeated compactions when kept messages still fit", () => {
+		const u1 = createMessageEntry(createUserMessage("user msg 1 (summarized by compaction1)"));
+		const a1 = createMessageEntry(createAssistantMessage("assistant msg 1"));
+		const u2 = createMessageEntry(createUserMessage("user msg 2 - kept by compaction1"));
+		const a2 = createMessageEntry(createAssistantMessage("assistant msg 2"));
+		const u3 = createMessageEntry(createUserMessage("user msg 3 - kept by compaction1"));
+		const a3 = createMessageEntry(createAssistantMessage("assistant msg 3", createMockUsage(5000, 1000)));
+		const compaction1 = createCompactionEntry("First summary", u2.id);
+		const u4 = createMessageEntry(createUserMessage("user msg 4 (new after compaction1)"));
+		const a4 = createMessageEntry(createAssistantMessage("assistant msg 4", createMockUsage(8000, 2000)));
+
+		const pathEntries = [u1, a1, u2, a2, u3, a3, compaction1, u4, a4];
+		const preparation = prepareCompaction(pathEntries, DEFAULT_COMPACTION_SETTINGS);
+
+		expect(preparation).toBeUndefined();
+	});
+
+	it("should re-summarize previously kept messages when the recent window moves past them", () => {
+		const u1 = createMessageEntry(createUserMessage("user msg 1 (summarized by compaction1)".repeat(4)));
+		const a1 = createMessageEntry(createAssistantMessage("assistant msg 1".repeat(4)));
+		const u2 = createMessageEntry(createUserMessage("user msg 2 - kept by compaction1 ".repeat(12)));
+		const a2 = createMessageEntry(createAssistantMessage("assistant msg 2 ".repeat(12)));
+		const u3 = createMessageEntry(createUserMessage("user msg 3 - kept by compaction1 ".repeat(12)));
+		const a3 = createMessageEntry(createAssistantMessage("assistant msg 3 ".repeat(12), createMockUsage(5000, 1000)));
+		const compaction1 = createCompactionEntry("First summary", u2.id);
+		const u4 = createMessageEntry(createUserMessage("user msg 4 (new after compaction1) ".repeat(12)));
+		const a4 = createMessageEntry(createAssistantMessage("assistant msg 4 ".repeat(12), createMockUsage(8000, 2000)));
+
+		const settings: CompactionSettings = {
+			...DEFAULT_COMPACTION_SETTINGS,
+			keepRecentTokens: 100,
+		};
+		const preparation = prepareCompaction([u1, a1, u2, a2, u3, a3, compaction1, u4, a4], settings);
+
+		expect(preparation).toBeDefined();
+		const summarizedText = extractText(preparation!.messagesToSummarize);
+		expect(summarizedText).toContain("user msg 2 - kept by compaction1");
+		expect(summarizedText).toContain("user msg 3 - kept by compaction1");
+		expect(summarizedText).not.toContain("First summary");
+		expect(preparation!.previousSummary).toBe("First summary");
 	});
 });
 

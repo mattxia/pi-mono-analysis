@@ -1,11 +1,30 @@
 import { homedir } from "os";
 import { join, resolve } from "path";
 import { describe, expect, it } from "vitest";
-import type { ResourceDiagnostic } from "../src/core/diagnostics.js";
-import { formatSkillsForPrompt, loadSkills, loadSkillsFromDir, type Skill } from "../src/core/skills.js";
+import type { ResourceDiagnostic } from "../src/core/diagnostics.ts";
+import { formatSkillsForPrompt, loadSkills, loadSkillsFromDir, type Skill } from "../src/core/skills.ts";
+import { createSyntheticSourceInfo } from "../src/core/source-info.ts";
 
 const fixturesDir = resolve(__dirname, "fixtures/skills");
 const collisionFixturesDir = resolve(__dirname, "fixtures/skills-collision");
+
+function createTestSkill(options: {
+	name: string;
+	description: string;
+	filePath: string;
+	baseDir: string;
+	disableModelInvocation?: boolean;
+	source?: string;
+}): Skill {
+	return {
+		name: options.name,
+		description: options.description,
+		filePath: options.filePath,
+		baseDir: options.baseDir,
+		sourceInfo: createSyntheticSourceInfo(options.filePath, { source: options.source ?? "test" }),
+		disableModelInvocation: options.disableModelInvocation ?? false,
+	};
+}
 
 describe("skills", () => {
 	describe("loadSkillsFromDir", () => {
@@ -18,11 +37,11 @@ describe("skills", () => {
 			expect(skills).toHaveLength(1);
 			expect(skills[0].name).toBe("valid-skill");
 			expect(skills[0].description).toBe("A valid skill for testing purposes.");
-			expect(skills[0].source).toBe("test");
+			expect(skills[0].sourceInfo.source).toBe("test");
 			expect(diagnostics).toHaveLength(0);
 		});
 
-		it("should warn when name doesn't match parent directory", () => {
+		it("should allow names that don't match parent directory", () => {
 			const { skills, diagnostics } = loadSkillsFromDir({
 				dir: join(fixturesDir, "name-mismatch"),
 				source: "test",
@@ -32,7 +51,7 @@ describe("skills", () => {
 			expect(skills[0].name).toBe("different-name");
 			expect(
 				diagnostics.some((d: ResourceDiagnostic) => d.message.includes("does not match parent directory")),
-			).toBe(true);
+			).toBe(false);
 		});
 
 		it("should warn when name contains invalid characters", () => {
@@ -210,14 +229,12 @@ describe("skills", () => {
 
 		it("should format skills as XML", () => {
 			const skills: Skill[] = [
-				{
+				createTestSkill({
 					name: "test-skill",
 					description: "A test skill.",
 					filePath: "/path/to/skill/SKILL.md",
 					baseDir: "/path/to/skill",
-					source: "test",
-					disableModelInvocation: false,
-				},
+				}),
 			];
 
 			const result = formatSkillsForPrompt(skills);
@@ -232,14 +249,12 @@ describe("skills", () => {
 
 		it("should include intro text before XML", () => {
 			const skills: Skill[] = [
-				{
+				createTestSkill({
 					name: "test-skill",
 					description: "A test skill.",
 					filePath: "/path/to/skill/SKILL.md",
 					baseDir: "/path/to/skill",
-					source: "test",
-					disableModelInvocation: false,
-				},
+				}),
 			];
 
 			const result = formatSkillsForPrompt(skills);
@@ -252,14 +267,12 @@ describe("skills", () => {
 
 		it("should escape XML special characters", () => {
 			const skills: Skill[] = [
-				{
+				createTestSkill({
 					name: "test-skill",
 					description: 'A skill with <special> & "characters".',
 					filePath: "/path/to/skill/SKILL.md",
 					baseDir: "/path/to/skill",
-					source: "test",
-					disableModelInvocation: false,
-				},
+				}),
 			];
 
 			const result = formatSkillsForPrompt(skills);
@@ -271,22 +284,18 @@ describe("skills", () => {
 
 		it("should format multiple skills", () => {
 			const skills: Skill[] = [
-				{
+				createTestSkill({
 					name: "skill-one",
 					description: "First skill.",
 					filePath: "/path/one/SKILL.md",
 					baseDir: "/path/one",
-					source: "test",
-					disableModelInvocation: false,
-				},
-				{
+				}),
+				createTestSkill({
 					name: "skill-two",
 					description: "Second skill.",
 					filePath: "/path/two/SKILL.md",
 					baseDir: "/path/two",
-					source: "test",
-					disableModelInvocation: false,
-				},
+				}),
 			];
 
 			const result = formatSkillsForPrompt(skills);
@@ -298,22 +307,19 @@ describe("skills", () => {
 
 		it("should exclude skills with disableModelInvocation from prompt", () => {
 			const skills: Skill[] = [
-				{
+				createTestSkill({
 					name: "visible-skill",
 					description: "A visible skill.",
 					filePath: "/path/visible/SKILL.md",
 					baseDir: "/path/visible",
-					source: "test",
-					disableModelInvocation: false,
-				},
-				{
+				}),
+				createTestSkill({
 					name: "hidden-skill",
 					description: "A hidden skill.",
 					filePath: "/path/hidden/SKILL.md",
 					baseDir: "/path/hidden",
-					source: "test",
 					disableModelInvocation: true,
-				},
+				}),
 			];
 
 			const result = formatSkillsForPrompt(skills);
@@ -325,14 +331,13 @@ describe("skills", () => {
 
 		it("should return empty string when all skills have disableModelInvocation", () => {
 			const skills: Skill[] = [
-				{
+				createTestSkill({
 					name: "hidden-skill",
 					description: "A hidden skill.",
 					filePath: "/path/hidden/SKILL.md",
 					baseDir: "/path/hidden",
-					source: "test",
 					disableModelInvocation: true,
-				},
+				}),
 			];
 
 			const result = formatSkillsForPrompt(skills);
@@ -349,9 +354,10 @@ describe("skills", () => {
 				agentDir: emptyAgentDir,
 				cwd: emptyCwd,
 				skillPaths: [join(fixturesDir, "valid-skill")],
+				includeDefaults: true,
 			});
 			expect(skills).toHaveLength(1);
-			expect(skills[0].source).toBe("path");
+			expect(skills[0].sourceInfo.scope).toBe("temporary");
 			expect(diagnostics).toHaveLength(0);
 		});
 
@@ -360,6 +366,7 @@ describe("skills", () => {
 				agentDir: emptyAgentDir,
 				cwd: emptyCwd,
 				skillPaths: ["/non/existent/path"],
+				includeDefaults: true,
 			});
 			expect(skills).toHaveLength(0);
 			expect(diagnostics.some((d: ResourceDiagnostic) => d.message.includes("does not exist"))).toBe(true);
@@ -371,11 +378,13 @@ describe("skills", () => {
 				agentDir: emptyAgentDir,
 				cwd: emptyCwd,
 				skillPaths: ["~/.pi/agent/skills"],
+				includeDefaults: true,
 			});
 			const { skills: withoutTilde } = loadSkills({
 				agentDir: emptyAgentDir,
 				cwd: emptyCwd,
 				skillPaths: [homeSkillsDir],
+				includeDefaults: true,
 			});
 			expect(withTilde.length).toBe(withoutTilde.length);
 		});
@@ -415,7 +424,7 @@ describe("skills", () => {
 			}
 
 			expect(skillMap.size).toBe(1);
-			expect(skillMap.get("calendar")?.source).toBe("first");
+			expect(skillMap.get("calendar")?.sourceInfo.source).toBe("first");
 			expect(collisionWarnings).toHaveLength(1);
 			expect(collisionWarnings[0].message).toContain("name collision");
 		});

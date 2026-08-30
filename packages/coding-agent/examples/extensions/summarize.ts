@@ -1,7 +1,7 @@
-import { complete, getModel } from "@mariozechner/pi-ai";
-import type { ExtensionAPI, ExtensionCommandContext } from "@mariozechner/pi-coding-agent";
-import { DynamicBorder, getMarkdownTheme } from "@mariozechner/pi-coding-agent";
-import { Container, Markdown, matchesKey, Text } from "@mariozechner/pi-tui";
+import { uuidv7 } from "@earendil-works/pi-ai";
+import type { ExtensionAPI, ExtensionCommandContext } from "@earendil-works/pi-coding-agent";
+import { DynamicBorder, getMarkdownTheme } from "@earendil-works/pi-coding-agent";
+import { Container, Markdown, matchesKey, Text } from "@earendil-works/pi-tui";
 
 type ContentBlock = {
 	type?: string;
@@ -115,7 +115,7 @@ const buildSummaryPrompt = (conversationText: string): string =>
 	].join("\n");
 
 const showSummaryUi = async (summary: string, ctx: ExtensionCommandContext) => {
-	if (!ctx.hasUI) {
+	if (ctx.mode !== "tui") {
 		return;
 	}
 
@@ -160,17 +160,13 @@ export default function (pi: ExtensionAPI) {
 				ctx.ui.notify("Preparing summary...", "info");
 			}
 
-			const model = getModel("openai", "gpt-5.2");
-			if (!model && ctx.hasUI) {
-				ctx.ui.notify("Model openai/gpt-5.2 not found", "warning");
+			const model = ctx.modelRegistry.find("openai", "gpt-5.2");
+			if (!model) {
+				if (ctx.hasUI) ctx.ui.notify("Model openai/gpt-5.2 not found", "warning");
+				return;
 			}
-
-			const apiKey = model ? await ctx.modelRegistry.getApiKey(model) : undefined;
-			if (!apiKey && ctx.hasUI) {
-				ctx.ui.notify("No API key for openai/gpt-5.2", "warning");
-			}
-
-			if (!model || !apiKey) {
+			if (!ctx.modelRegistry.hasConfiguredAuth(model)) {
+				if (ctx.hasUI) ctx.ui.notify("No authentication configured for openai/gpt-5.2", "warning");
 				return;
 			}
 
@@ -182,7 +178,15 @@ export default function (pi: ExtensionAPI) {
 				},
 			];
 
-			const response = await complete(model, { messages: summaryMessages }, { apiKey, reasoningEffort: "high" });
+			const response = await ctx.modelRegistry.complete(
+				model,
+				{ messages: summaryMessages },
+				{
+					reasoningEffort: "high",
+					cacheRetention: "none",
+					sessionId: uuidv7(),
+				},
+			);
 
 			const summary = response.content
 				.filter((c): c is { type: "text"; text: string } => c.type === "text")

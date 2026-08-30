@@ -5,11 +5,14 @@
 import chalk from "chalk";
 import { existsSync, mkdirSync, readdirSync, readFileSync, renameSync, rmSync, writeFileSync } from "fs";
 import { dirname, join } from "path";
-import { CONFIG_DIR_NAME, getAgentDir, getBinDir } from "./config.js";
+import { CONFIG_DIR_NAME, getAgentDir, getBinDir } from "./config.ts";
+import { migrateKeybindingsConfig } from "./core/keybindings.ts";
+import { stripBom } from "./utils/text.ts";
 
 const MIGRATION_GUIDE_URL =
-	"https://github.com/badlogic/pi-mono/blob/main/packages/coding-agent/CHANGELOG.md#extensions-migration";
-const EXTENSIONS_DOC_URL = "https://github.com/badlogic/pi-mono/blob/main/packages/coding-agent/docs/extensions.md";
+	"https://github.com/earendil-works/pi-mono/blob/main/packages/coding-agent/CHANGELOG.md#extensions-migration";
+const EXTENSIONS_DOC_URL =
+	"https://github.com/earendil-works/pi-mono/blob/main/packages/coding-agent/docs/extensions.md";
 
 /**
  * Migrate legacy oauth.json and settings.json apiKeys to auth.json.
@@ -31,7 +34,7 @@ export function migrateAuthToAuthJson(): string[] {
 	// Migrate oauth.json
 	if (existsSync(oauthPath)) {
 		try {
-			const oauth = JSON.parse(readFileSync(oauthPath, "utf-8"));
+			const oauth = JSON.parse(stripBom(readFileSync(oauthPath, "utf-8")));
 			for (const [provider, cred] of Object.entries(oauth)) {
 				migrated[provider] = { type: "oauth", ...(cred as object) };
 				providers.push(provider);
@@ -46,7 +49,7 @@ export function migrateAuthToAuthJson(): string[] {
 	if (existsSync(settingsPath)) {
 		try {
 			const content = readFileSync(settingsPath, "utf-8");
-			const settings = JSON.parse(content);
+			const settings = JSON.parse(stripBom(content));
 			if (settings.apiKeys && typeof settings.apiKeys === "object") {
 				for (const [provider, key] of Object.entries(settings.apiKeys)) {
 					if (!migrated[provider] && typeof key === "string") {
@@ -77,7 +80,7 @@ export function migrateAuthToAuthJson(): string[] {
  * ~/.pi/agent/sessions/<encoded-cwd>/. This migration moves them
  * to the correct location based on the cwd in their session header.
  *
- * See: https://github.com/badlogic/pi-mono/issues/320
+ * See: https://github.com/earendil-works/pi-mono/issues/320
  */
 export function migrateSessionsFromAgentRoot(): void {
 	const agentDir = getAgentDir();
@@ -150,6 +153,23 @@ function migrateCommandsToPrompts(baseDir: string, label: string): boolean {
 		}
 	}
 	return false;
+}
+
+function migrateKeybindingsConfigFile(): void {
+	const configPath = join(getAgentDir(), "keybindings.json");
+	if (!existsSync(configPath)) return;
+
+	try {
+		const parsed = JSON.parse(stripBom(readFileSync(configPath, "utf-8"))) as unknown;
+		if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) {
+			return;
+		}
+		const { config, migrated } = migrateKeybindingsConfig(parsed as Record<string, unknown>);
+		if (!migrated) return;
+		writeFileSync(configPath, `${JSON.stringify(config, null, 2)}\n`, "utf-8");
+	} catch {
+		// Ignore malformed files during migration
+	}
 }
 
 /**
@@ -283,13 +303,14 @@ export async function showDeprecationWarnings(warnings: string[]): Promise<void>
  *
  * @returns Object with migration results and deprecation warnings
  */
-export function runMigrations(cwd: string = process.cwd()): {
+export function runMigrations(cwd: string): {
 	migratedAuthProviders: string[];
 	deprecationWarnings: string[];
 } {
 	const migratedAuthProviders = migrateAuthToAuthJson();
 	migrateSessionsFromAgentRoot();
 	migrateToolsToBin();
+	migrateKeybindingsConfigFile();
 	const deprecationWarnings = migrateExtensionSystem(cwd);
 	return { migratedAuthProviders, deprecationWarnings };
 }

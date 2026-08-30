@@ -1,7 +1,7 @@
-import { CancellableLoader, Container, Loader, Spacer, Text, type TUI } from "@mariozechner/pi-tui";
-import type { Theme } from "../theme/theme.js";
-import { DynamicBorder } from "./dynamic-border.js";
-import { keyHint } from "./keybinding-hints.js";
+import { CancellableLoader, Container, Loader, Spacer, Text, type TUI } from "@earendil-works/pi-tui";
+import type { Theme } from "../theme/theme.ts";
+import { DynamicBorder } from "./dynamic-border.ts";
+import { keyHint } from "./keybinding-hints.ts";
 
 /** Loader wrapped with borders for extension UI */
 export class BorderedLoader extends Container {
@@ -33,7 +33,7 @@ export class BorderedLoader extends Container {
 		this.addChild(this.loader);
 		if (this.cancellable) {
 			this.addChild(new Spacer(1));
-			this.addChild(new Text(keyHint("selectCancel", "cancel"), 1, 0));
+			this.addChild(new Text(keyHint("tui.select.cancel", "cancel"), 1, 0));
 		}
 		this.addChild(new Spacer(1));
 		this.addChild(new DynamicBorder(borderColor));
@@ -61,6 +61,8 @@ export class BorderedLoader extends Container {
 	dispose(): void {
 		if ("dispose" in this.loader && typeof this.loader.dispose === "function") {
 			this.loader.dispose();
+		} else if ("stop" in this.loader && typeof this.loader.stop === "function") {
+			this.loader.stop();
 		}
 	}
 }

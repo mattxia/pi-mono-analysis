@@ -12,14 +12,23 @@
  */
 
 import * as crypto from "node:crypto";
-import type { AgentSession } from "../../core/agent-session.js";
+import type { AgentSessionRuntime } from "../../core/agent-session-runtime.ts";
 import type {
 	ExtensionUIContext,
 	ExtensionUIDialogOptions,
 	ExtensionWidgetOptions,
-} from "../../core/extensions/index.js";
-import { type Theme, theme } from "../interactive/theme/theme.js";
-import { attachJsonlLineReader, serializeJsonLine } from "./jsonl.js";
+	WorkingIndicatorOptions,
+} from "../../core/extensions/index.ts";
+import {
+	flushRawStdout,
+	takeOverStdout,
+	waitForRawStdoutBackpressure,
+	writeRawStdout,
+} from "../../core/output-guard.ts";
+import { killTrackedDetachedChildren } from "../../utils/shell.ts";
+import { type Theme, theme } from "../interactive/theme/theme.ts";
+import { toJsonEvent } from "../json-event.ts";
+import { attachJsonlLineReader, serializeJsonLine } from "./jsonl.ts";
 import type {
 	RpcCommand,
 	RpcExtensionUIRequest,
@@ -27,7 +36,7 @@ import type {
 	RpcResponse,
 	RpcSessionState,
 	RpcSlashCommand,
-} from "./rpc-types.js";
+} from "./rpc-types.ts";
 
 // Re-export types for consumers
 export type {
@@ -36,15 +45,20 @@ export type {
 	RpcExtensionUIResponse,
 	RpcResponse,
 	RpcSessionState,
-} from "./rpc-types.js";
+} from "./rpc-types.ts";
 
 /**
  * Run in RPC mode.
  * Listens for JSON commands on stdin, outputs events and responses on stdout.
  */
-export async function runRpcMode(session: AgentSession): Promise<never> {
+export async function runRpcMode(runtimeHost: AgentSessionRuntime): Promise<never> {
+	takeOverStdout();
+	let session = runtimeHost.session;
+	let unsubscribe: (() => void) | undefined;
+	let unsubscribeBackpressure: (() => void) | undefined;
+
 	const output = (obj: RpcResponse | RpcExtensionUIRequest | object) => {
-		process.stdout.write(serializeJsonLine(obj));
+		writeRawStdout(serializeJsonLine(obj));
 	};
 
 	const success = <T extends RpcCommand["type"]>(
@@ -70,6 +84,8 @@ export async function runRpcMode(session: AgentSession): Promise<never> {
 
 	// Shutdown request flag
 	let shutdownRequested = false;
+	let shuttingDown = false;
+	const signalCleanupHandlers: Array<() => void> = [];
 
 	/** Helper for dialog methods with signal/timeout support */
 	function createDialogPromise<T>(
@@ -164,6 +180,18 @@ export async function runRpcMode(session: AgentSession): Promise<never> {
 			// Working message not supported in RPC mode - requires TUI loader access
 		},
 
+		setWorkingVisible(_visible: boolean): void {
+			// Working visibility not supported in RPC mode - requires TUI loader access
+		},
+
+		setWorkingIndicator(_options?: WorkingIndicatorOptions): void {
+			// Working indicator customization not supported in RPC mode - requires TUI loader access
+		},
+
+		setHiddenThinkingLabel(_label?: string): void {
+			// Hidden thinking label not supported in RPC mode - requires TUI message rendering access
+		},
+
 		setWidget(key: string, content: unknown, options?: ExtensionWidgetOptions): void {
 			// Only support string arrays in RPC mode - factory functions are ignored
 			if (content === undefined || Array.isArray(content)) {
@@ -242,8 +270,17 @@ export async function runRpcMode(session: AgentSession): Promise<never> {
 			});
 		},
 
+		addAutocompleteProvider(): void {
+			// Autocomplete provider composition is not supported in RPC mode
+		},
+
 		setEditorComponent(): void {
 			// Custom editor components not supported in RPC mode
+		},
+
+		getEditorComponent() {
+			// Custom editor components not supported in RPC mode
+			return undefined;
 		},
 
 		get theme() {
@@ -273,52 +310,80 @@ export async function runRpcMode(session: AgentSession): Promise<never> {
 		},
 	});
 
-	// Set up extensions with RPC-based UI context
-	await session.bindExtensions({
-		uiContext: createExtensionUIContext(),
-		commandContextActions: {
-			waitForIdle: () => session.agent.waitForIdle(),
-			newSession: async (options) => {
-				// Delegate to AgentSession (handles setup + agent state sync)
-				const success = await session.newSession(options);
-				return { cancelled: !success };
-			},
-			fork: async (entryId) => {
-				const result = await session.fork(entryId);
-				return { cancelled: result.cancelled };
-			},
-			navigateTree: async (targetId, options) => {
-				const result = await session.navigateTree(targetId, {
-					summarize: options?.summarize,
-					customInstructions: options?.customInstructions,
-					replaceInstructions: options?.replaceInstructions,
-					label: options?.label,
-				});
-				return { cancelled: result.cancelled };
-			},
-			switchSession: async (sessionPath) => {
-				const success = await session.switchSession(sessionPath);
-				return { cancelled: !success };
-			},
-			reload: async () => {
-				await session.reload();
-			},
-		},
-		shutdownHandler: () => {
-			shutdownRequested = true;
-		},
-		onError: (err) => {
-			output({ type: "extension_error", extensionPath: err.extensionPath, event: err.event, error: err.error });
-		},
+	runtimeHost.setRebindSession(async () => {
+		await rebindSession();
 	});
 
-	// Output all agent events as JSON
-	session.subscribe((event) => {
-		output(event);
-	});
+	const rebindSession = async (): Promise<void> => {
+		session = runtimeHost.session;
+		await session.bindExtensions({
+			uiContext: createExtensionUIContext(),
+			mode: "rpc",
+			commandContextActions: {
+				waitForIdle: () => session.waitForIdle(),
+				newSession: async (options) => runtimeHost.newSession(options),
+				fork: async (entryId, forkOptions) => {
+					const result = await runtimeHost.fork(entryId, forkOptions);
+					return { cancelled: result.cancelled };
+				},
+				navigateTree: async (targetId, options) => {
+					const result = await session.navigateTree(targetId, {
+						summarize: options?.summarize,
+						customInstructions: options?.customInstructions,
+						replaceInstructions: options?.replaceInstructions,
+						label: options?.label,
+					});
+					return { cancelled: result.cancelled };
+				},
+				switchSession: async (sessionPath, options) => {
+					return runtimeHost.switchSession(sessionPath, options);
+				},
+				reload: async () => {
+					await session.reload();
+				},
+			},
+			shutdownHandler: () => {
+				shutdownRequested = true;
+			},
+			onError: (err) => {
+				output({ type: "extension_error", extensionPath: err.extensionPath, event: err.event, error: err.error });
+			},
+		});
+
+		unsubscribe?.();
+		unsubscribeBackpressure?.();
+		unsubscribe = session.subscribe((event) => {
+			output(toJsonEvent(event));
+			if (event.type === "agent_settled") {
+				void checkShutdownRequested();
+			}
+		});
+		unsubscribeBackpressure = session.agent.subscribe(async () => {
+			await waitForRawStdoutBackpressure();
+		});
+	};
+
+	const registerSignalHandlers = (): void => {
+		const signals: NodeJS.Signals[] = ["SIGTERM"];
+		if (process.platform !== "win32") {
+			signals.push("SIGHUP");
+		}
+
+		for (const signal of signals) {
+			const handler = () => {
+				killTrackedDetachedChildren();
+				void shutdown(signal === "SIGHUP" ? 129 : 143, signal);
+			};
+			process.on(signal, handler);
+			signalCleanupHandlers.push(() => process.off(signal, handler));
+		}
+	};
+
+	await rebindSession();
+	registerSignalHandlers();
 
 	// Handle a single command
-	const handleCommand = async (command: RpcCommand): Promise<RpcResponse> => {
+	const handleCommand = async (command: RpcCommand): Promise<RpcResponse | undefined> => {
 		const id = command.id;
 
 		switch (command.type) {
@@ -327,17 +392,27 @@ export async function runRpcMode(session: AgentSession): Promise<never> {
 			// =================================================================
 
 			case "prompt": {
-				// Don't await - events will stream
-				// Extension commands are executed immediately, file prompt templates are expanded
-				// If streaming and streamingBehavior specified, queues via steer/followUp
-				session
+				// Start prompt handling immediately, but emit the authoritative response only after
+				// prompt preflight succeeds. Queued and immediately handled prompts also count as success.
+				let preflightSucceeded = false;
+				void session
 					.prompt(command.message, {
 						images: command.images,
 						streamingBehavior: command.streamingBehavior,
 						source: "rpc",
+						preflightResult: (didSucceed) => {
+							if (didSucceed) {
+								preflightSucceeded = true;
+								output(success(id, "prompt"));
+							}
+						},
 					})
-					.catch((e) => output(error(id, "prompt", e.message)));
-				return success(id, "prompt");
+					.catch((e) => {
+						if (!preflightSucceeded) {
+							output(error(id, "prompt", e.message));
+						}
+					});
+				return undefined;
 			}
 
 			case "steer": {
@@ -355,10 +430,17 @@ export async function runRpcMode(session: AgentSession): Promise<never> {
 				return success(id, "abort");
 			}
 
+			case "clear_queue": {
+				return success(id, "clear_queue", session.clearQueue());
+			}
+
 			case "new_session": {
 				const options = command.parentSession ? { parentSession: command.parentSession } : undefined;
-				const cancelled = !(await session.newSession(options));
-				return success(id, "new_session", { cancelled });
+				const result = await runtimeHost.newSession(options);
+				if (!result.cancelled) {
+					await rebindSession();
+				}
+				return success(id, "new_session", result);
 			}
 
 			// =================================================================
@@ -388,7 +470,7 @@ export async function runRpcMode(session: AgentSession): Promise<never> {
 			// =================================================================
 
 			case "set_model": {
-				const models = await session.modelRegistry.getAvailable();
+				const models = session.modelRuntime.getAvailableSnapshot();
 				const model = models.find((m) => m.provider === command.provider && m.id === command.modelId);
 				if (!model) {
 					return error(id, "set_model", `Model not found: ${command.provider}/${command.modelId}`);
@@ -406,7 +488,7 @@ export async function runRpcMode(session: AgentSession): Promise<never> {
 			}
 
 			case "get_available_models": {
-				const models = await session.modelRegistry.getAvailable();
+				const models = session.modelRuntime.getAvailableSnapshot();
 				return success(id, "get_available_models", { models });
 			}
 
@@ -425,6 +507,11 @@ export async function runRpcMode(session: AgentSession): Promise<never> {
 					return success(id, "cycle_thinking_level", null);
 				}
 				return success(id, "cycle_thinking_level", { level });
+			}
+
+			case "get_available_thinking_levels": {
+				const levels = session.getAvailableThinkingLevels();
+				return success(id, "get_available_thinking_levels", { levels });
 			}
 
 			// =================================================================
@@ -474,7 +561,25 @@ export async function runRpcMode(session: AgentSession): Promise<never> {
 			// =================================================================
 
 			case "bash": {
-				const result = await session.executeBash(command.command);
+				const eventResult = await session.extensionRunner.emitUserBash({
+					type: "user_bash",
+					command: command.command,
+					excludeFromContext: command.excludeFromContext ?? false,
+					cwd: session.sessionManager.getCwd(),
+				});
+
+				if (eventResult?.result) {
+					session.recordBashResult(command.command, eventResult.result, {
+						excludeFromContext: command.excludeFromContext,
+					});
+					return success(id, "bash", eventResult.result);
+				}
+
+				const result = await session.executeBash(command.command, undefined, {
+					excludeFromContext: command.excludeFromContext,
+					id,
+					operations: eventResult?.operations,
+				});
 				return success(id, "bash", result);
 			}
 
@@ -498,18 +603,54 @@ export async function runRpcMode(session: AgentSession): Promise<never> {
 			}
 
 			case "switch_session": {
-				const cancelled = !(await session.switchSession(command.sessionPath));
-				return success(id, "switch_session", { cancelled });
+				const result = await runtimeHost.switchSession(command.sessionPath);
+				if (!result.cancelled) {
+					await rebindSession();
+				}
+				return success(id, "switch_session", result);
 			}
 
 			case "fork": {
-				const result = await session.fork(command.entryId);
+				const result = await runtimeHost.fork(command.entryId);
+				if (!result.cancelled) {
+					await rebindSession();
+				}
 				return success(id, "fork", { text: result.selectedText, cancelled: result.cancelled });
+			}
+
+			case "clone": {
+				const leafId = session.sessionManager.getLeafId();
+				if (!leafId) {
+					return error(id, "clone", "Cannot clone session: no current entry selected");
+				}
+				const result = await runtimeHost.fork(leafId, { position: "at" });
+				if (!result.cancelled) {
+					await rebindSession();
+				}
+				return success(id, "clone", { cancelled: result.cancelled });
 			}
 
 			case "get_fork_messages": {
 				const messages = session.getUserMessagesForForking();
 				return success(id, "get_fork_messages", { messages });
+			}
+
+			case "get_entries": {
+				const sessionManager = session.sessionManager;
+				let entries = sessionManager.getEntries();
+				if (command.since !== undefined) {
+					const sinceIndex = entries.findIndex((e) => e.id === command.since);
+					if (sinceIndex === -1) {
+						return error(id, "get_entries", `Entry not found: ${command.since}`);
+					}
+					entries = entries.slice(sinceIndex + 1);
+				}
+				return success(id, "get_entries", { entries, leafId: sessionManager.getLeafId() });
+			}
+
+			case "get_tree": {
+				const sessionManager = session.sessionManager;
+				return success(id, "get_tree", { tree: sessionManager.getTree(), leafId: sessionManager.getLeafId() });
 			}
 
 			case "get_last_assistant_text": {
@@ -541,35 +682,30 @@ export async function runRpcMode(session: AgentSession): Promise<never> {
 			case "get_commands": {
 				const commands: RpcSlashCommand[] = [];
 
-				// Extension commands
-				for (const { command, extensionPath } of session.extensionRunner?.getRegisteredCommandsWithPaths() ?? []) {
+				for (const command of session.extensionRunner.getRegisteredCommands()) {
 					commands.push({
-						name: command.name,
+						name: command.invocationName,
 						description: command.description,
 						source: "extension",
-						path: extensionPath,
+						sourceInfo: command.sourceInfo,
 					});
 				}
 
-				// Prompt templates (source is always "user" | "project" | "path" in coding-agent)
 				for (const template of session.promptTemplates) {
 					commands.push({
 						name: template.name,
 						description: template.description,
 						source: "prompt",
-						location: template.source as RpcSlashCommand["location"],
-						path: template.filePath,
+						sourceInfo: template.sourceInfo,
 					});
 				}
 
-				// Skills (source is always "user" | "project" | "path" in coding-agent)
 				for (const skill of session.resourceLoader.getSkills().skills) {
 					commands.push({
 						name: `skill:${skill.name}`,
 						description: skill.description,
 						source: "skill",
-						location: skill.source as RpcSlashCommand["location"],
-						path: skill.filePath,
+						sourceInfo: skill.sourceInfo,
 					});
 				}
 
@@ -578,7 +714,7 @@ export async function runRpcMode(session: AgentSession): Promise<never> {
 
 			default: {
 				const unknownCommand = command as { type: string };
-				return error(undefined, unknownCommand.type, `Unknown command: ${unknownCommand.type}`);
+				return error(id, unknownCommand.type, `Unknown command: ${unknownCommand.type}`);
 			}
 		}
 	};
@@ -589,49 +725,96 @@ export async function runRpcMode(session: AgentSession): Promise<never> {
 	 */
 	let detachInput = () => {};
 
-	async function checkShutdownRequested(): Promise<void> {
-		if (!shutdownRequested) return;
-
-		const currentRunner = session.extensionRunner;
-		if (currentRunner?.hasHandlers("session_shutdown")) {
-			await currentRunner.emit({ type: "session_shutdown" });
+	async function shutdown(exitCode = 0, signal?: NodeJS.Signals): Promise<never> {
+		if (shuttingDown) {
+			process.exit(exitCode);
 		}
-
+		shuttingDown = true;
+		for (const cleanup of signalCleanupHandlers) {
+			cleanup();
+		}
+		unsubscribe?.();
+		unsubscribeBackpressure?.();
+		await runtimeHost.dispose();
 		detachInput();
 		process.stdin.pause();
-		process.exit(0);
+		if (signal !== "SIGTERM") {
+			await flushRawStdout();
+		}
+		process.exit(exitCode);
+	}
+
+	async function checkShutdownRequested(): Promise<void> {
+		if (!shutdownRequested) return;
+		await shutdown();
 	}
 
 	const handleInputLine = async (line: string) => {
+		let parsed: unknown;
 		try {
-			const parsed = JSON.parse(line);
+			parsed = JSON.parse(line);
+		} catch (parseError: unknown) {
+			output(
+				error(
+					undefined,
+					"parse",
+					`Failed to parse command: ${parseError instanceof Error ? parseError.message : String(parseError)}`,
+				),
+			);
+			await waitForRawStdoutBackpressure();
+			return;
+		}
 
-			// Handle extension UI responses
-			if (parsed.type === "extension_ui_response") {
-				const response = parsed as RpcExtensionUIResponse;
-				const pending = pendingExtensionRequests.get(response.id);
-				if (pending) {
-					pendingExtensionRequests.delete(response.id);
-					pending.resolve(response);
-				}
-				return;
+		// Handle extension UI responses
+		if (
+			typeof parsed === "object" &&
+			parsed !== null &&
+			"type" in parsed &&
+			parsed.type === "extension_ui_response"
+		) {
+			const response = parsed as RpcExtensionUIResponse;
+			const pending = pendingExtensionRequests.get(response.id);
+			if (pending) {
+				pendingExtensionRequests.delete(response.id);
+				pending.resolve(response);
 			}
+			return;
+		}
 
-			// Handle regular commands
-			const command = parsed as RpcCommand;
+		const command = parsed as RpcCommand;
+		try {
 			const response = await handleCommand(command);
-			output(response);
-
-			// Check for deferred shutdown request (idle between commands)
+			if (response) {
+				output(response);
+				await waitForRawStdoutBackpressure();
+			}
 			await checkShutdownRequested();
-		} catch (e: any) {
-			output(error(undefined, "parse", `Failed to parse command: ${e.message}`));
+		} catch (commandError: unknown) {
+			output(
+				error(
+					command.id,
+					command.type,
+					commandError instanceof Error ? commandError.message : String(commandError),
+				),
+			);
+			await waitForRawStdoutBackpressure();
 		}
 	};
 
-	detachInput = attachJsonlLineReader(process.stdin, (line) => {
-		void handleInputLine(line);
-	});
+	const onInputEnd = () => {
+		void shutdown();
+	};
+	process.stdin.on("end", onInputEnd);
+
+	detachInput = (() => {
+		const detachJsonl = attachJsonlLineReader(process.stdin, (line) => {
+			void handleInputLine(line);
+		});
+		return () => {
+			detachJsonl();
+			process.stdin.off("end", onInputEnd);
+		};
+	})();
 
 	// Keep process alive forever
 	return new Promise(() => {});

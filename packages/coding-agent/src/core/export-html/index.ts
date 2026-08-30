@@ -1,11 +1,12 @@
-import type { AgentState } from "@mariozechner/pi-agent-core";
+import type { AgentState } from "@earendil-works/pi-agent-core";
 import { existsSync, readFileSync, writeFileSync } from "fs";
 import { basename, join } from "path";
-import { APP_NAME, getExportTemplateDir } from "../../config.js";
-import { getResolvedThemeColors, getThemeExportColors } from "../../modes/interactive/theme/theme.js";
-import type { ToolInfo } from "../extensions/types.js";
-import type { SessionEntry } from "../session-manager.js";
-import { SessionManager } from "../session-manager.js";
+import { APP_NAME, getExportTemplateDir } from "../../config.ts";
+import { getResolvedThemeColors, getThemeExportColors } from "../../modes/interactive/theme/theme.ts";
+import { normalizePath, resolvePath } from "../../utils/paths.ts";
+import type { ToolDefinition } from "../extensions/types.ts";
+import type { SessionEntry } from "../session-manager.ts";
+import { SessionManager } from "../session-manager.ts";
 
 /**
  * Interface for rendering custom tools to HTML.
@@ -13,9 +14,10 @@ import { SessionManager } from "../session-manager.js";
  */
 export interface ToolHtmlRenderer {
 	/** Render a tool call to HTML. Returns undefined if tool has no custom renderer. */
-	renderCall(toolName: string, args: unknown): string | undefined;
+	renderCall(toolCallId: string, toolName: string, args: unknown): string | undefined;
 	/** Render a tool result to HTML. Returns collapsed/expanded or undefined if tool has no custom renderer. */
 	renderResult(
+		toolCallId: string,
 		toolName: string,
 		result: Array<{ type: string; text?: string; data?: string; mimeType?: string }>,
 		details: unknown,
@@ -130,7 +132,7 @@ interface SessionData {
 	entries: ReturnType<SessionManager["getEntries"]>;
 	leafId: string | null;
 	systemPrompt?: string;
-	tools?: ToolInfo[];
+	tools?: Array<Pick<ToolDefinition, "name" | "description" | "parameters">>;
 	/** Pre-rendered HTML for custom tool calls/results, keyed by tool call ID */
 	renderedTools?: Record<string, RenderedToolHtml>;
 }
@@ -148,10 +150,11 @@ function generateHtml(sessionData: SessionData, themeName?: string): string {
 
 	const themeVars = generateThemeVars(themeName);
 	const colors = getResolvedThemeColors(themeName);
-	const exportColors = deriveExportColors(colors.userMessageBg || "#343541");
-	const bodyBg = exportColors.pageBg;
-	const containerBg = exportColors.cardBg;
-	const infoBg = exportColors.infoBg;
+	const themeExport = getThemeExportColors(themeName);
+	const derivedExportColors = deriveExportColors(colors.userMessageBg || "#343541");
+	const bodyBg = themeExport.pageBg ?? derivedExportColors.pageBg;
+	const containerBg = themeExport.cardBg ?? derivedExportColors.cardBg;
+	const infoBg = themeExport.infoBg ?? derivedExportColors.infoBg;
 
 	// Base64 encode session data to avoid escaping issues
 	const sessionDataBase64 = Buffer.from(JSON.stringify(sessionData)).toString("base64");
@@ -171,8 +174,8 @@ function generateHtml(sessionData: SessionData, themeName?: string): string {
 		.replace("{{HIGHLIGHT_JS}}", hljsJs);
 }
 
-/** Built-in tool names that have custom rendering in template.js */
-const BUILTIN_TOOLS = new Set(["bash", "read", "write", "edit", "ls", "find", "grep"]);
+/** Tools rendered directly by the HTML template (not pre-rendered via TUI→ANSI→HTML pipeline) */
+const TEMPLATE_RENDERED_TOOLS = new Set(["bash", "read", "write", "edit", "ls"]);
 
 /**
  * Pre-render custom tools to HTML using their TUI renderers.
@@ -190,8 +193,8 @@ function preRenderCustomTools(
 		// Find tool calls in assistant messages
 		if (msg.role === "assistant" && Array.isArray(msg.content)) {
 			for (const block of msg.content) {
-				if (block.type === "toolCall" && !BUILTIN_TOOLS.has(block.name)) {
-					const callHtml = toolRenderer.renderCall(block.name, block.arguments);
+				if (block.type === "toolCall" && !TEMPLATE_RENDERED_TOOLS.has(block.name)) {
+					const callHtml = toolRenderer.renderCall(block.id, block.name, block.arguments);
 					if (callHtml) {
 						renderedTools[block.id] = { callHtml };
 					}
@@ -202,10 +205,16 @@ function preRenderCustomTools(
 		// Find tool results
 		if (msg.role === "toolResult" && msg.toolCallId) {
 			const toolName = msg.toolName || "";
-			// Only render if we have a pre-rendered call OR it's not a built-in tool
+			// Only render if we have a pre-rendered call OR it's not template-rendered
 			const existing = renderedTools[msg.toolCallId];
-			if (existing || !BUILTIN_TOOLS.has(toolName)) {
-				const rendered = toolRenderer.renderResult(toolName, msg.content, msg.details, msg.isError || false);
+			if (existing || !TEMPLATE_RENDERED_TOOLS.has(toolName)) {
+				const rendered = toolRenderer.renderResult(
+					msg.toolCallId,
+					toolName,
+					msg.content,
+					msg.details,
+					msg.isError || false,
+				);
 				if (rendered) {
 					renderedTools[msg.toolCallId] = {
 						...existing,
@@ -262,7 +271,7 @@ export async function exportSessionToHtml(
 
 	const html = generateHtml(sessionData, opts.themeName);
 
-	let outputPath = opts.outputPath;
+	let outputPath = opts.outputPath ? normalizePath(opts.outputPath) : undefined;
 	if (!outputPath) {
 		const sessionBasename = basename(sessionFile, ".jsonl");
 		outputPath = `${APP_NAME}-session-${sessionBasename}.html`;
@@ -278,12 +287,13 @@ export async function exportSessionToHtml(
  */
 export async function exportFromFile(inputPath: string, options?: ExportOptions | string): Promise<string> {
 	const opts: ExportOptions = typeof options === "string" ? { outputPath: options } : options || {};
+	const resolvedInputPath = resolvePath(inputPath);
 
-	if (!existsSync(inputPath)) {
-		throw new Error(`File not found: ${inputPath}`);
+	if (!existsSync(resolvedInputPath)) {
+		throw new Error(`File not found: ${resolvedInputPath}`);
 	}
 
-	const sm = SessionManager.open(inputPath);
+	const sm = SessionManager.open(resolvedInputPath);
 
 	const sessionData: SessionData = {
 		header: sm.getHeader(),
@@ -295,9 +305,9 @@ export async function exportFromFile(inputPath: string, options?: ExportOptions 
 
 	const html = generateHtml(sessionData, opts.themeName);
 
-	let outputPath = opts.outputPath;
+	let outputPath = opts.outputPath ? normalizePath(opts.outputPath) : undefined;
 	if (!outputPath) {
-		const inputBasename = basename(inputPath, ".jsonl");
+		const inputBasename = basename(resolvedInputPath, ".jsonl");
 		outputPath = `${APP_NAME}-session-${inputBasename}.html`;
 	}
 
